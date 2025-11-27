@@ -53,3 +53,5 @@ I feel it is a bit late to start, but I am confident that I can complete the pro
 - Created a local .env file to store API keys securely.
 
 - Added .env to .gitignore to ensure keys are not committed to Git.
+
+```
