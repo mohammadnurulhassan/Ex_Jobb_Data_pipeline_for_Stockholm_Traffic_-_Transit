@@ -29,11 +29,11 @@ I feel it is a bit late to start, but I am confident that I can complete the pro
   - Created a new private repo for the project on GitHub.
   - Added a short README with project title and one-sentence description.
 
--  **Created base folder structure (locally and/or in repo)**  
+-  **Created base folder structure (locally and in repo)**  
 
-  Current structure:
+- Current structure:
 
-  ```text
+```text
   smart-traffic-stockholm/
     docs/
       logbook.md        # this file
@@ -43,8 +43,12 @@ I feel it is a bit late to start, but I am confident that I can complete the pro
     dashboard/
     notebooks/
     data_raw/
+```
+---
 
-- **Set up API keys**
+
+
+### Set up API keys
 
 - Registered / logged in to Trafiklab (and/or SL) and confirmed access.
 
@@ -54,4 +58,4 @@ I feel it is a bit late to start, but I am confident that I can complete the pro
 
 - Added .env to .gitignore to ensure keys are not committed to Git.
 
-```
+---
