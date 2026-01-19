@@ -1,0 +1,8 @@
+version: 2
+
+sources:
+  - name: trafiklab_raw
+    schema: raw_trafiklab        # schema in DuckDB
+    tables:
+      - name: trafiklab_departures
+        description: "Raw departures from Trafiklab Realtime Timetables via dlt."
