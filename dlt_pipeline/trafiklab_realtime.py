@@ -1,28 +1,54 @@
 import os
+import time
 from datetime import datetime
 from typing import Iterator, Dict, Any
 
 import dlt
 from pathlib import Path
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 
 # Load variables from .env (REALTIME_API_KEY)
 load_dotenv()
 
+# ✅ Correct base URL for Trafiklab Realtime Timetables API
 BASE_URL = "https://realtime-api.trafiklab.se/v1"
 
-# 👉 Example area_id from docs: 740000002 = Göteborg C (demo)
-# Later you should replace this with a Stockholm area id
-# that you fetch via Trafiklab Stop Lookup.
-DEFAULT_AREA_ID = "740000002"
+# Stockholm C (you can change later if needed)
+DEFAULT_AREA_ID = "740000001"
+
+
+def _requests_session() -> requests.Session:
+    """Requests session with retry/backoff for unstable connections."""
+    session = requests.Session()
+
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        status=5,
+        backoff_factor=1.0,  # 1s, 2s, 4s, 8s...
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+SESSION = _requests_session()
 
 
 def _call_timetables_departures(area_id: str, when: datetime | None = None) -> Dict[str, Any]:
     """
     Call Trafiklab Realtime Timetables 'departures' endpoint for one area_id.
 
-    Docs example:
+    Example:
       https://realtime-api.trafiklab.se/v1/departures/{area_id}?key=API_KEY
     """
     api_key = os.getenv("REALTIME_API_KEY")
@@ -30,23 +56,47 @@ def _call_timetables_departures(area_id: str, when: datetime | None = None) -> D
         raise RuntimeError("REALTIME_API_KEY is not set. Put it in .env or environment variables.")
 
     if when is None:
-        # current time window (next 60 minutes)
         url = f"{BASE_URL}/departures/{area_id}"
     else:
-        # specific datetime in format YYYY-MM-DDTHH:mm
         time_str = when.strftime("%Y-%m-%dT%H:%M")
         url = f"{BASE_URL}/departures/{area_id}/{time_str}"
 
-    # key is sent as query parameter ?key=API_KEY
-    response = requests.get(url, params={"key": api_key}, timeout=30)
-    response.raise_for_status()
-    data = response.json()
-    return data
+    params = {"key": api_key}
+
+    # Manual retry layer for ChunkedEncodingError / ProtocolError type issues
+    last_err: Exception | None = None
+    for attempt in range(1, 6):
+        try:
+            resp = SESSION.get(url, params=params, timeout=(10, 60))  # connect, read
+            resp.raise_for_status()
+            return resp.json()
+
+        except (
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ) as e:
+            last_err = e
+            sleep_s = min(2 ** attempt, 20)
+            print(f"[WARN] Request failed ({type(e).__name__}) attempt {attempt}/5. Sleeping {sleep_s}s...")
+            time.sleep(sleep_s)
+
+        except requests.exceptions.HTTPError as e:
+            last_err = e
+            code = getattr(e.response, "status_code", None)
+            if code in (429, 500, 502, 503, 504):
+                sleep_s = min(2 ** attempt, 20)
+                print(f"[WARN] HTTP {code} attempt {attempt}/5. Sleeping {sleep_s}s...")
+                time.sleep(sleep_s)
+                continue
+            raise
+
+    raise RuntimeError(f"Failed to fetch departures after retries. Last error: {last_err}")
 
 
 def _flatten_departures(response: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     """
-    Take the JSON response from Trafiklab Timetables and yield flat rows
+    Take JSON response from Trafiklab Realtime Timetables and yield flat rows
     for each departure (good for analytics).
     """
     timestamp = response.get("timestamp")
@@ -60,9 +110,8 @@ def _flatten_departures(response: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
         agency = dep.get("agency", {}) or {}
         stop = dep.get("stop", {}) or {}
 
-        # One flattened row per departure
         yield {
-            # Metadata about this API call
+            # Metadata
             "response_timestamp": timestamp,
             "query_time": query_time,
             "query_area_id": query_area_id,
@@ -107,16 +156,14 @@ def _flatten_departures(response: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
 
 @dlt.resource(
     name="trafiklab_departures",
-    write_disposition="append",  # append new rows each run
-    primary_key=["trip_id", "scheduled_time"]  # a simple composite key
+    write_disposition="append",
+    primary_key=["trip_id", "scheduled_time"],
 )
 def trafiklab_departures_resource(
     area_id: str = DEFAULT_AREA_ID,
     when: datetime | None = None,
 ) -> Iterator[Dict[str, Any]]:
-    """
-    dlt resource: calls the API and yields flattened departure rows.
-    """
+    """dlt resource: calls API and yields flattened departure rows."""
     response = _call_timetables_departures(area_id=area_id, when=when)
     yield from _flatten_departures(response)
 
@@ -126,10 +173,7 @@ def trafiklab_realtime_source(
     area_id: str = DEFAULT_AREA_ID,
     when: datetime | None = None,
 ):
-    """
-    dlt source combining all resources (for now only departures).
-    Later you can add arrivals or multiple stops here.
-    """
+    """dlt source combining all resources (for now only departures)."""
     return trafiklab_departures_resource(area_id=area_id, when=when)
 
 
@@ -142,12 +186,10 @@ def run_once(
     area_id: str = DEFAULT_AREA_ID,
     when: datetime | None = None,
 ):
-    """
-    Helper to run the pipeline once from CLI / VS Code.
-    """
+    """Helper to run pipeline once from CLI / VS Code."""
     pipeline = dlt.pipeline(
         pipeline_name="trafiklab_realtime",
-        destination=dlt.destinations.duckdb(str(DUCKDB_PATH)),  # ✅ correct attribute
+        destination=dlt.destinations.duckdb(str(DUCKDB_PATH)),
         dataset_name="raw_trafiklab",
     )
 
@@ -157,5 +199,4 @@ def run_once(
 
 
 if __name__ == "__main__":
-    # Example: run for default area id, current time
     run_once()

@@ -1,176 +1,251 @@
-import duckdb
 from pathlib import Path
-
 import pandas as pd
-import streamlit as st
+import plotly.express as px
 
-# --- Optional: ML model support ---
+from taipy.gui import Gui, notify
+
+from queries import (
+    load_base_data,
+    compute_kpis,
+    delays_by_hour,
+    delays_by_line,
+)
+
+# Optional ML deps
 try:
     import joblib
     HAS_JOBLIB = True
 except ImportError:
     HAS_JOBLIB = False
 
-# --- Connect to DuckDB warehouse ---
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = PROJECT_ROOT / "warehouse" / "trafiklab_realtime.duckdb"
 
+MODEL_PATH = PROJECT_ROOT / "models" / "delay_model.pkl"
+FEATURES_PATH = PROJECT_ROOT / "models" / "delay_model_features.joblib"
 
-@st.cache_resource
-def get_connection():
-    return duckdb.connect(str(DB_PATH))
+# ----------------------------
+# Load data once at startup
+# ----------------------------
+df_all = load_base_data()
 
-
-@st.cache_data
-def load_delay_data():
-    con = get_connection()
-    df = con.execute(
-        """
-        SELECT
-            service_date,
-            hour_of_day,
-            day_of_week,
-            route_designation,
-            route_transport_mode,
-            stop_name,
-            delay_seconds,
-            is_delayed
-        FROM analytics.fct_departure_delays
-        """
-    ).fetchdf()
-    return df
-
-
-# --- Streamlit app ---
-st.set_page_config(page_title="Stockholm Traffic – Realtime Analytics", layout="wide")
-
-st.title("Stockholm Traffic & Transit – Delay Overview")
-
-df = load_delay_data()
-
-if df.empty:
-    st.warning(
-        "No data found in analytics.fct_departure_delays yet. "
-        "Run the dlt pipeline and dbt models first."
-    )
-    st.stop()
-
-# ==========================
 # Filters
-# ==========================
-col1, col2, col3 = st.columns(3)
-with col1:
-    modes = df["route_transport_mode"].dropna().unique().tolist()
-    selected_modes = st.multiselect("Transport mode", modes, default=modes)
+delay_threshold = 60
 
-with col2:
-    lines = df["route_designation"].dropna().unique().tolist()
-    default_lines = lines[:5] if len(lines) >= 5 else lines
-    selected_lines = st.multiselect("Lines", lines[:10], default=default_lines)
+modes = sorted(df_all["route_transport_mode"].dropna().unique().tolist()) if not df_all.empty else []
+selected_modes = modes[:]  # default all
 
-with col3:
-    max_delay = int(df["delay_seconds"].fillna(0).max())
-    delay_threshold = st.slider("Delay threshold (seconds)", 0, max_delay, 60)
+lines = sorted(df_all["route_designation"].dropna().unique().tolist()) if not df_all.empty else []
+selected_lines = lines[:5] if len(lines) >= 5 else lines[:]  # default some
 
-# Apply filters
-filtered = df.copy()
+# Outputs
+kpi_total = 0
+kpi_delayed = 0
+kpi_avg_delay = 0.0
 
-if selected_modes:
-    filtered = filtered[filtered["route_transport_mode"].isin(selected_modes)]
-if selected_lines:
-    filtered = filtered[filtered["route_designation"].isin(selected_lines)]
+df_filtered = pd.DataFrame()
+fig_hourly = None
+fig_line = None
 
-# ==========================
-# KPIs
-# ==========================
-total_dep = len(filtered)
+# ML state
+ml_ready = False
+ml_status = ""
+pred_hour = 8
+pred_day = 1
+pred_line = lines[0] if lines else ""
+pred_delay = None
 
-# delayed based on threshold
-delayed_mask = filtered["delay_seconds"].fillna(0) > delay_threshold
-delayed_dep = delayed_mask.sum()
-avg_delay = filtered["delay_seconds"].mean()
+_model = None
+_feature_cols = None
 
-k1, k2, k3 = st.columns(3)
-k1.metric("Total departures", f"{total_dep}")
-k2.metric(f"Delayed departures (> {delay_threshold}s)", f"{int(delayed_dep)}")
-k3.metric(
-    "Average delay (sec)",
-    f"{avg_delay:.1f}" if avg_delay is not None else "0.0",
-)
 
-# ==========================
-# Charts
-# ==========================
-st.subheader("Delays by hour of day")
-hourly = (
-    filtered.groupby("hour_of_day")
-    .agg(avg_delay=("delay_seconds", "mean"), count=("delay_seconds", "count"))
-    .reset_index()
-)
-if not hourly.empty:
-    st.bar_chart(hourly.set_index("hour_of_day")["avg_delay"])
-else:
-    st.info("No data available for the selected filters (hourly view).")
+def _load_model():
+    global ml_ready, ml_status, _model, _feature_cols
 
-st.subheader("Delays by line")
-line_delay = (
-    filtered.groupby("route_designation")
-    .agg(avg_delay=("delay_seconds", "mean"), count=("delay_seconds", "count"))
-    .reset_index()
-    .sort_values("avg_delay", ascending=False)
-    .head(20)
-)
-if not line_delay.empty:
-    st.bar_chart(line_delay.set_index("route_designation")["avg_delay"])
-else:
-    st.info("No data available for the selected filters (line view).")
+    if not HAS_JOBLIB:
+        ml_ready = False
+        ml_status = "joblib is not installed in this environment."
+        return
 
-# ==========================
-# Simple delay prediction demo
-# ==========================
-# Load model + feature list
-st.subheader("Simple delay prediction (demo)")
-model_path = PROJECT_ROOT / "models" / "delay_model.pkl"
-features_path = PROJECT_ROOT / "models" / "delay_model_features.joblib"
+    if not MODEL_PATH.exists():
+        ml_ready = False
+        ml_status = "Model file not found. Run scripts/train_delay_model.py"
+        return
 
-if not HAS_JOBLIB:
-    st.info("Prediction model not available (joblib not installed in this environment).")
-elif not model_path.exists() or not features_path.exists():
-    st.info("Model or feature list not found. Run scripts/train_delay_model.py first.")
-else:
-    model = joblib.load(model_path)
-    feature_cols = joblib.load(features_path)
-
-    col_a, col_b, col_c = st.columns(3)
-    with col_a:
-        pred_hour = st.slider("Hour of day", 0, 23, 8)
-    with col_b:
-        pred_day = st.selectbox("Day of week (0=Sun)", list(range(7)), index=1)
-    with col_c:
-        sample_line = df["route_designation"].dropna().unique().tolist()
-        pred_line = st.selectbox("Line for prediction", sample_line[:20] if sample_line else [""])
-
-    # Build raw input
-    row = {
-        "hour_of_day": pred_hour,
-        "day_of_week": pred_day,
-    }
-
-    # One-hot column name exactly like training produced
-    if pred_line and pred_line != "":
-        row[f"route_designation_{pred_line}"] = 1
-
-    # Create dataframe and align to training features
-    X_pred = pd.DataFrame([row])
-
-    # IMPORTANT: make columns exactly match training (missing -> 0, extra -> drop, correct order)
-    X_pred = X_pred.reindex(columns=feature_cols, fill_value=0)
+    if not FEATURES_PATH.exists():
+        ml_ready = False
+        ml_status = "Feature list not found. Re-run scripts/train_delay_model.py"
+        return
 
     try:
-        pred_delay = model.predict(X_pred)[0]
-        st.write(f"**Predicted delay:** {pred_delay:.1f} seconds (approx.)")
+        _model = joblib.load(MODEL_PATH)
+        _feature_cols = joblib.load(FEATURES_PATH)
+        ml_ready = True
+        ml_status = "ML model loaded successfully."
     except Exception as e:
-        st.error(f"Prediction error: {e}")
+        ml_ready = False
+        ml_status = f"Failed to load model: {e}"
+
+
+def apply_filters():
+    global df_filtered, kpi_total, kpi_delayed, kpi_avg_delay, fig_hourly, fig_line
+
+    if df_all.empty:
+        df_filtered = pd.DataFrame()
+        kpi_total, kpi_delayed, kpi_avg_delay = 0, 0, 0.0
+        fig_hourly = None
+        fig_line = None
+        return
+
+    df = df_all.copy()
+
+    if selected_modes:
+        df = df[df["route_transport_mode"].isin(selected_modes)]
+    if selected_lines:
+        df = df[df["route_designation"].isin(selected_lines)]
+
+    df_filtered = df
+
+    kpis = compute_kpis(df_filtered, delay_threshold)
+    kpi_total = kpis["total"]
+    kpi_delayed = kpis["delayed"]
+    kpi_avg_delay = kpis["avg_delay"]
+
+    # Charts
+    df_hourly = delays_by_hour(df_filtered)
+    df_line = delays_by_line(df_filtered)
+
+    fig_hourly = px.bar(df_hourly, x="hour_of_day", y="avg_delay", title="Average delay by hour")
+    fig_line = px.bar(df_line, x="route_designation", y="avg_delay", title="Average delay by line (Top 20)")
+
+
+def predict_delay(state=None):
+    global pred_delay
+
+    if not ml_ready:
+        pred_delay = None
+        if state is not None:
+            notify(state, "warning", f"ML not ready: {ml_status}")
+        return
+
+    # Build input row
+    row = {
+        "hour_of_day": int(pred_hour),
+        "day_of_week": int(pred_day),
+    }
+
+    # Add one-hot for selected line (only that one = 1)
+    if pred_line:
+        row[f"route_designation_{pred_line}"] = 1
+
+    X_pred = pd.DataFrame([row])
+
+    # Critical: align to training features (names + order)
+    X_pred = X_pred.reindex(columns=_feature_cols, fill_value=0)
+
+    try:
+        pred_delay = float(_model.predict(X_pred)[0])
+        if state is not None:
+            notify(state, "success", f"Predicted delay: {pred_delay:.1f} seconds")
+    except Exception as e:
+        pred_delay = None
+        if state is not None:
+            notify(state, "error", f"Prediction failed: {e}")
+
+
+def on_change(state, var_name, var_value):
+    apply_filters()
+
+
+def refresh_data(state):
+    global df_all, modes, lines, selected_modes, selected_lines, pred_line
+
+    df_all = load_base_data()
+
+    modes = sorted(df_all["route_transport_mode"].dropna().unique().tolist()) if not df_all.empty else []
+    lines = sorted(df_all["route_designation"].dropna().unique().tolist()) if not df_all.empty else []
+
+    selected_modes = modes[:]
+    selected_lines = lines[:5] if len(lines) >= 5 else lines[:]
+    pred_line = lines[0] if lines else ""
+
+    apply_filters()
+    notify(state, "success", "Data refreshed from DuckDB.")
+
+
+# Initialize
+apply_filters()
+_load_model()
+
+# ----------------------------
+# UI
+# ----------------------------
+page = """
+# Stockholm Traffic & Transit – Delay Overview (Taipy)
+
+**Warehouse:** `{DB_PATH}`
+
+<|Refresh data|button|on_action=refresh_data|>
+
+---
+
+## Filters
+
+<|{selected_modes}|selector|lov={modes}|multiple=True|dropdown=True|label=Transport mode|on_change=on_change|>
+
+<|{selected_lines}|selector|lov={lines}|multiple=True|dropdown=True|label=Lines|on_change=on_change|>
+
+<|{delay_threshold}|slider|min=0|max=900|step=30|label=Delay threshold (seconds)|on_change=on_change|>
+
+---
+
+## KPIs
+
+<|layout|columns=3|
+<|Total departures|text|>
+<|{kpi_total}|text|class_name=h2|>
+|
+<|Delayed departures|text|>
+<|{kpi_delayed}|text|class_name=h2|>
+|
+<|Average delay (sec)|text|>
+<|{kpi_avg_delay:.1f}|text|class_name=h2|>
+|>
+
+---
+
+## Charts
+
+<|{fig_hourly}|plotly|height=420px|>
+
+<|{fig_line}|plotly|height=520px|>
+
+---
+
+## ML: Predict delay (demo)
+
+**ML status:** {ml_status}
+
+<|layout|columns=3|
+<|{pred_hour}|slider|min=0|max=23|step=1|label=Hour of day|>
+|
+<|{pred_day}|selector|lov={[0,1,2,3,4,5,6]}|dropdown=True|label=Day of week (0=Sun)|>
+|
+<|{pred_line}|selector|lov={lines}|dropdown=True|label=Line|>
+|>
+
+<|Predict delay|button|on_action=predict_delay|>
+
+<|Predicted delay (sec): {pred_delay}|text|>
+
+---
+
+## Data preview (filtered)
+
+<|{df_filtered}|table|page_size=15|height=420px|>
+"""
+
+Gui(page).run(title="Stockholm Traffic – Taipy Dashboard", use_reloader=True)
 
 
 

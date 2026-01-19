@@ -28,13 +28,16 @@ df = con.execute("""
     WHERE delay_seconds IS NOT NULL
 """).fetchdf()
 
+if df.empty:
+    raise RuntimeError("No data available in analytics.fct_departure_delays. Run dbt models first.")
+
 # One-hot encode route_designation
 df = pd.get_dummies(df, columns=["route_designation"], dummy_na=True)
 
 y = df["delay_seconds"]
 X = df.drop(columns=["delay_seconds"])
 
-# Save the exact feature columns used during training
+# Save exact feature list used during training
 feature_cols = list(X.columns)
 
 X_train, X_test, y_train, y_test = train_test_split(
@@ -50,14 +53,14 @@ model.fit(X_train, y_train)
 
 y_pred = model.predict(X_test)
 mae = mean_absolute_error(y_test, y_pred)
-print(f"MAE (seconds): {mae:.2f}")
 
 joblib.dump(model, MODEL_PATH)
 joblib.dump(feature_cols, FEATURES_PATH)
 
+print(f"MAE (seconds): {mae:.2f}")
 print("Model saved to:", MODEL_PATH)
 print("Feature list saved to:", FEATURES_PATH)
-print("Number of features:", len(feature_cols))
+print("Num features:", len(feature_cols))
 
 
 
