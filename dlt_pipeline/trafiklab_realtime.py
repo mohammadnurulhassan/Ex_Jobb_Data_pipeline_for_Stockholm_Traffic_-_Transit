@@ -158,6 +158,11 @@ def _flatten_departures(response: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     name="trafiklab_departures",
     write_disposition="append",
     primary_key=["trip_id", "scheduled_time"],
+    columns={
+        "route__name": {"data_type": "text"},
+        "scheduled_platform": {"data_type": "text", "nullable": True},
+        "realtime_platform": {"data_type": "text", "nullable": True},
+    },
 )
 def trafiklab_departures_resource(
     area_id: str = DEFAULT_AREA_ID,
