@@ -1,286 +1,240 @@
 from pathlib import Path
-import pandas as pd
 import duckdb
+import pandas as pd
+from taipy.gui import Gui
+import plotly.express as px
 
-from taipy.gui import Gui, notify
-
-# Optional ML deps
-try:
-    import joblib
-    HAS_JOBLIB = True
-except ImportError:
-    HAS_JOBLIB = False
-
-
-# ----------------------------
-# Paths
-# ----------------------------
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# -----------------------------
+# Config
+# -----------------------------
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = PROJECT_ROOT / "warehouse" / "trafiklab_realtime.duckdb"
 
-MODEL_PATH = PROJECT_ROOT / "models" / "delay_model.pkl"
-FEATURES_PATH = PROJECT_ROOT / "models" / "delay_model_features.joblib"
+SCHEMA = "analytics_analytics"
+TBL_DAILY = f"{SCHEMA}.mart_mobility_kpis_daily"
+TBL_HOURLY = f"{SCHEMA}.mart_mobility_kpis_hourly"
+TBL_FRESH = f"{SCHEMA}.mart_data_freshness"
 
 
-# ----------------------------
-# Data loading helpers
-# ----------------------------
-def load_base_data() -> pd.DataFrame:
-    con = duckdb.connect(str(DB_PATH))
-    df = con.execute("""
-        SELECT
+def q(sql: str, params=None) -> pd.DataFrame:
+    """Run SQL against DuckDB and return pandas DataFrame."""
+    con = duckdb.connect(str(DB_PATH), read_only=True)
+    try:
+        if params:
+            df = con.execute(sql, params).df()
+        else:
+            df = con.execute(sql).df()
+        return df
+    finally:
+        con.close()
+
+
+# -----------------------------
+# Data loaders
+# -----------------------------
+def load_available_dates() -> list[str]:
+    df = q(f"select distinct service_date from {TBL_DAILY} order by service_date desc;")
+    if df.empty:
+        return []
+    return [str(d) for d in df["service_date"].tolist()]
+
+
+def load_kpis(service_date: str) -> dict:
+    df = q(
+        f"""
+        select
             service_date,
-            hour_of_day,
+            departures_total,
+            departures_canceled,
+            avg_delay_seconds,
+            delay_rate,
+            on_time_rate,
+            realtime_coverage
+        from {TBL_DAILY}
+        where service_date = ?
+        """,
+        [service_date],
+    )
+
+    fresh = q(f"select * from {TBL_FRESH};")
+    minutes_lag = None
+    latest_ts = None
+    if not fresh.empty:
+        minutes_lag = int(fresh.loc[0, "minutes_since_last_update"])
+        latest_ts = str(fresh.loc[0, "latest_response_timestamp"])
+
+    if df.empty:
+        return {
+            "departures_total": 0,
+            "departures_canceled": 0,
+            "avg_delay_seconds": None,
+            "delay_rate": None,
+            "on_time_rate": None,
+            "realtime_coverage": None,
+            "minutes_since_last_update": minutes_lag,
+            "latest_response_timestamp": latest_ts,
+        }
+
+    row = df.iloc[0].to_dict()
+    row["minutes_since_last_update"] = minutes_lag
+    row["latest_response_timestamp"] = latest_ts
+    return row
+
+
+def load_hourly_today(service_date: str) -> pd.DataFrame:
+    return q(
+        f"""
+        select
+            service_date,
             day_of_week,
-            route_designation,
-            route_transport_mode,
-            stop_name,
-            delay_seconds,
-            is_delayed
-        FROM analytics.fct_departure_delays
-    """).fetchdf()
-    con.close()
-    return df
-
-
-def compute_kpis(df: pd.DataFrame, threshold: int) -> dict:
-    if df.empty:
-        return {"total": 0, "delayed": 0, "avg_delay": 0.0}
-
-    total = len(df)
-    delayed = int((df["delay_seconds"].fillna(0) > threshold).sum())
-    avg_delay = float(df["delay_seconds"].mean()) if df["delay_seconds"].notna().any() else 0.0
-    return {"total": total, "delayed": delayed, "avg_delay": avg_delay}
-
-
-def delays_by_hour(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=["hour_of_day", "avg_delay", "count"])
-    return (
-        df.groupby("hour_of_day", as_index=False)
-          .agg(avg_delay=("delay_seconds", "mean"), count=("delay_seconds", "count"))
-          .sort_values("hour_of_day")
+            hour_of_day,
+            transport_category,
+            departures_total,
+            avg_delay_seconds,
+            delay_rate,
+            on_time_rate
+        from {TBL_HOURLY}
+        where service_date = ?
+        """,
+        [service_date],
     )
 
 
-def delays_by_line(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=["route_designation", "avg_delay", "count"])
-    return (
-        df.groupby("route_designation", as_index=False)
-          .agg(avg_delay=("delay_seconds", "mean"), count=("delay_seconds", "count"))
-          .sort_values("avg_delay", ascending=False)
-          .head(20)
+# -----------------------------
+# Plot builders (Plotly)
+# -----------------------------
+def build_trend(df_hourly: pd.DataFrame):
+    # aggregate across transport_category for a single line
+    d = (
+        df_hourly.groupby("hour_of_day", as_index=False)
+        .agg(avg_delay_seconds=("avg_delay_seconds", "mean"))
+        .sort_values("hour_of_day")
+    )
+    fig = px.line(d, x="hour_of_day", y="avg_delay_seconds", markers=True)
+    fig.update_layout(title="Average delay by hour (seconds)", xaxis_title="Hour", yaxis_title="Avg delay (s)")
+    return fig
+
+
+def build_bar_mode(df_hourly: pd.DataFrame):
+    d = (
+        df_hourly.groupby("transport_category", as_index=False)
+        .agg(on_time_rate=("on_time_rate", "mean"),
+             avg_delay_seconds=("avg_delay_seconds", "mean"),
+             departures_total=("departures_total", "sum"))
+        .sort_values("on_time_rate")
+    )
+    fig = px.bar(d, x="transport_category", y="on_time_rate", hover_data=["avg_delay_seconds", "departures_total"])
+    fig.update_layout(title="On-time rate by transport mode", xaxis_title="Mode", yaxis_title="On-time rate")
+    return fig
+
+
+def build_heatmap(df_hourly: pd.DataFrame):
+    # Use avg_delay_seconds across transport_category (mean)
+    d = (
+        df_hourly.groupby(["day_of_week", "hour_of_day"], as_index=False)
+        .agg(avg_delay_seconds=("avg_delay_seconds", "mean"))
     )
 
+    # pivot for heatmap
+    pivot = d.pivot(index="day_of_week", columns="hour_of_day", values="avg_delay_seconds").fillna(0)
 
-# ----------------------------
-# App state
-# ----------------------------
-df_all = load_base_data()
-
-delay_threshold = 60
-
-modes = sorted(df_all["route_transport_mode"].dropna().unique().tolist()) if not df_all.empty else []
-selected_modes = modes[:]
-
-lines = sorted(df_all["route_designation"].dropna().unique().tolist()) if not df_all.empty else []
-selected_lines = lines[:5] if len(lines) >= 5 else lines[:]
-
-df_filtered = pd.DataFrame()
-df_hourly = pd.DataFrame()
-df_line = pd.DataFrame()
-
-kpi_total = 0
-kpi_delayed = 0
-kpi_avg_delay = 0.0
-
-# ML state
-ml_ready = False
-ml_status = ""
-pred_hour = 8
-pred_day = 1
-pred_line = lines[0] if lines else ""
-pred_delay = None
-
-_model = None
-_feature_cols = None
+    fig = px.imshow(pivot, aspect="auto")
+    fig.update_layout(
+        title="Delay heatmap (day of week x hour)",
+        xaxis_title="Hour of day",
+        yaxis_title="Day of week (0=Sun)",
+    )
+    return fig
 
 
-def load_model():
-    global ml_ready, ml_status, _model, _feature_cols
+# -----------------------------
+# Taipy state
+# -----------------------------
+available_dates = load_available_dates()
+selected_date = available_dates[0] if available_dates else None
 
-    if not HAS_JOBLIB:
-        ml_ready = False
-        ml_status = "joblib not installed. Install: uv pip install joblib scikit-learn"
-        return
+kpi = load_kpis(selected_date) if selected_date else {}
+df_hourly = load_hourly_today(selected_date) if selected_date else pd.DataFrame()
 
-    if not MODEL_PATH.exists():
-        ml_ready = False
-        ml_status = "Model not found. Run: python scripts/train_delay_model.py"
-        return
-
-    if not FEATURES_PATH.exists():
-        ml_ready = False
-        ml_status = "Feature list not found. Re-run: python scripts/train_delay_model.py"
-        return
-
-    try:
-        _model = joblib.load(MODEL_PATH)
-        _feature_cols = joblib.load(FEATURES_PATH)
-        ml_ready = True
-        ml_status = "ML model loaded successfully."
-    except Exception as e:
-        ml_ready = False
-        ml_status = f"Failed to load model: {e}"
+fig_trend = build_trend(df_hourly) if not df_hourly.empty else None
+fig_bar = build_bar_mode(df_hourly) if not df_hourly.empty else None
+fig_heatmap = build_heatmap(df_hourly) if not df_hourly.empty else None
 
 
-def apply_filters():
-    global df_filtered, df_hourly, df_line, kpi_total, kpi_delayed, kpi_avg_delay
-
-    if df_all.empty:
-        df_filtered = pd.DataFrame()
-        df_hourly = pd.DataFrame()
-        df_line = pd.DataFrame()
-        kpi_total, kpi_delayed, kpi_avg_delay = 0, 0, 0.0
-        return
-
-    df = df_all.copy()
-
-    if selected_modes:
-        df = df[df["route_transport_mode"].isin(selected_modes)]
-
-    if selected_lines:
-        df = df[df["route_designation"].isin(selected_lines)]
-
-    df_filtered = df
-
-    kpis = compute_kpis(df_filtered, delay_threshold)
-    kpi_total = kpis["total"]
-    kpi_delayed = kpis["delayed"]
-    kpi_avg_delay = kpis["avg_delay"]
-
-    df_hourly = delays_by_hour(df_filtered)
-    df_line = delays_by_line(df_filtered)
+def fmt_pct(x):
+    if x is None or pd.isna(x):
+        return "-"
+    return f"{x*100:.1f}%"
 
 
-def on_change(state, var_name, var_value):
-    apply_filters()
+def fmt_num(x):
+    if x is None or pd.isna(x):
+        return "-"
+    return f"{x:,.0f}"
 
 
-def refresh_data(state):
-    global df_all, modes, lines, selected_modes, selected_lines, pred_line
-
-    df_all = load_base_data()
-
-    modes = sorted(df_all["route_transport_mode"].dropna().unique().tolist()) if not df_all.empty else []
-    lines = sorted(df_all["route_designation"].dropna().unique().tolist()) if not df_all.empty else []
-
-    selected_modes = modes[:]
-    selected_lines = lines[:5] if len(lines) >= 5 else lines[:]
-    pred_line = lines[0] if lines else ""
-
-    apply_filters()
-    notify(state, "success", "Data refreshed from DuckDB.")
+def fmt_delay(x):
+    if x is None or pd.isna(x):
+        return "-"
+    # seconds -> minutes
+    return f"{x/60:.1f} min"
 
 
-def predict_delay(state):
-    global pred_delay
+def on_date_change(state):
+    state.kpi = load_kpis(state.selected_date)
+    state.df_hourly = load_hourly_today(state.selected_date)
 
-    if not ml_ready:
-        pred_delay = None
-        notify(state, "warning", f"ML not ready: {ml_status}")
-        return
-
-    row = {
-        "hour_of_day": int(pred_hour),
-        "day_of_week": int(pred_day),
-    }
-    if pred_line:
-        row[f"route_designation_{pred_line}"] = 1
-
-    X_pred = pd.DataFrame([row])
-    X_pred = X_pred.reindex(columns=_feature_cols, fill_value=0)
-
-    try:
-        pred_delay = float(_model.predict(X_pred)[0])
-        notify(state, "success", f"Predicted delay: {pred_delay:.1f} seconds")
-    except Exception as e:
-        pred_delay = None
-        notify(state, "error", f"Prediction failed: {e}")
+    if not state.df_hourly.empty:
+        state.fig_trend = build_trend(state.df_hourly)
+        state.fig_bar = build_bar_mode(state.df_hourly)
+        state.fig_heatmap = build_heatmap(state.df_hourly)
+    else:
+        state.fig_trend = None
+        state.fig_bar = None
+        state.fig_heatmap = None
 
 
-# Initialize
-apply_filters()
-load_model()
-
+# -----------------------------
+# Taipy page (Markdown)
+# -----------------------------
 page = """
-# Stockholm Traffic & Transit – Delay Overview (Taipy)
+# Stockholm Mobility Overview (Page 1)
 
-**DuckDB:** `{DB_PATH}`
-
-<|Refresh data|button|on_action=refresh_data|>
+## Date
+<|{selected_date}|selector|lov={available_dates}|on_change=on_date_change|dropdown|>
 
 ---
 
-## Filters
-
-<|{selected_modes}|selector|lov={modes}|multiple=True|dropdown=True|label=Transport mode|on_change=on_change|>
-
-<|{selected_lines}|selector|lov={lines}|multiple=True|dropdown=True|label=Lines|on_change=on_change|>
-
-<|{delay_threshold}|slider|min=0|max=900|step=30|label=Delay threshold (seconds)|on_change=on_change|>
+## Data freshness
+Latest timestamp: **<|{kpi.get('latest_response_timestamp','-')}|>**  
+Minutes since update: **<|{kpi.get('minutes_since_last_update','-')}|>**
 
 ---
 
 ## KPIs
-
-<|layout|columns=3|
-<|Total departures|text|>
-<|{kpi_total}|text|class_name=h2|>
-|
-<|Delayed departures (> threshold)|text|>
-<|{kpi_delayed}|text|class_name=h2|>
-|
-<|Average delay (sec)|text|>
-<|{kpi_avg_delay:.1f}|text|class_name=h2|>
-|>
+Departures: **<|{fmt_num(kpi.get('departures_total'))}|>**  
+On-time rate: **<|{fmt_pct(kpi.get('on_time_rate'))}|>**  
+Avg delay: **<|{fmt_delay(kpi.get('avg_delay_seconds'))}|>**  
+Delay rate (>60s): **<|{fmt_pct(kpi.get('delay_rate'))}|>**  
+Canceled: **<|{fmt_num(kpi.get('departures_canceled'))}|>**  
+Realtime coverage: **<|{fmt_pct(kpi.get('realtime_coverage'))}|>**
 
 ---
 
-## Chart: Average delay by hour
+## Charts
+### Average delay by hour
+<|{fig_trend}|chart|height=350px|>
 
-<|{df_hourly}|chart|type=bar|x=hour_of_day|y=avg_delay|height=380px|>
+### On-time rate by transport mode
+<|{fig_bar}|chart|height=350px|>
 
----
-
-## Chart: Average delay by line (Top 20)
-
-<|{df_line}|chart|type=bar|x=route_designation|y=avg_delay|height=520px|>
-
----
-
-## ML: Predict delay (demo)
-
-**ML status:** {ml_status}
-
-<|layout|columns=3|
-<|{pred_hour}|slider|min=0|max=23|step=1|label=Hour of day|>
-|
-<|{pred_day}|selector|lov={[0,1,2,3,4,5,6]}|dropdown=True|label=Day of week (0=Sun)|>
-|
-<|{pred_line}|selector|lov={lines}|dropdown=True|label=Line|>
-|>
-
-<|Predict delay|button|on_action=predict_delay|>
-
-<|Predicted delay (sec): {pred_delay}|text|>
+### Delay heatmap (day x hour)
+<|{fig_heatmap}|chart|height=420px|>
 
 ---
 
-## Data preview (filtered)
-
-<|{df_filtered}|table|page_size=15|height=420px|>
+## Hourly table preview
+<|{df_hourly}|table|page_size=15|>
 """
 
-Gui(page).run(title="Stockholm Traffic – Taipy Dashboard", use_reloader=True)
+
