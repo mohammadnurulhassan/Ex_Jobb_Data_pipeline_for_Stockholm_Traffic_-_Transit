@@ -1,6 +1,5 @@
 -- fct_departure_delays.sql
--- বৈজ্ঞানিকভাবে delay নিয়ে aggregated fact টেবিল বানাচ্ছি,
--- যা dashboard আর ML উভয়েই ব্যবহার করতে পারবে।
+-- delay নিয়ে analytics fact টেবিল, dashboard + ML ready
 
 with base as (
 
@@ -11,6 +10,8 @@ with base as (
         delay_seconds,
         route_designation,
         route_transport_mode,
+        transport_category,
+        stop_id,
         stop_name
     from {{ ref('stg_trafiklab_departures') }}
 
@@ -23,8 +24,12 @@ enhanced as (
         scheduled_time,
         realtime_time,
         delay_seconds,
+
         route_designation,
         route_transport_mode,
+        transport_category,
+
+        stop_id,
         stop_name,
 
         -- time dimensions
@@ -35,7 +40,7 @@ enhanced as (
         -- delay flags
         case 
             when delay_seconds is null then null
-            when delay_seconds > 60 then 1    -- > 1 minute
+            when delay_seconds > 60 then 1
             else 0
         end as is_delayed
 

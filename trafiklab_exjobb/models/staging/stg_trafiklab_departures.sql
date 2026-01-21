@@ -1,5 +1,5 @@
 -- stg_trafiklab_departures.sql
--- বাংলা ধারণা: raw টেবিলকে একটু clean করে analytics-friendly বানাচ্ছি।
+-- বাংলা ধারণা: raw টেবিলকে clean করে analytics-friendly বানাচ্ছি।
 
 with src as (
 
@@ -16,12 +16,19 @@ with src as (
         canceled,
         is_realtime,
 
+        -- platform (optional)
+        scheduled_platform,
+        realtime_platform,
+
         -- route info
         route_name,
         route_designation,
         route_transport_mode_code,
         route_transport_mode,
         route_direction,
+
+        -- OUR CATEGORY (from DLT flatten)
+        transport_category,
 
         -- origin / destination
         origin_stop_id,
@@ -50,7 +57,7 @@ with src as (
 )
 
 select
-    -- optional surrogate key (simple concat, no dbt_utils needed)
+    -- optional surrogate key (simple concat)
     concat_ws(
         '-',
         coalesce(trip_id, ''),
@@ -66,21 +73,31 @@ select
     delay_seconds,
     canceled,
     is_realtime,
+
+    scheduled_platform,
+    realtime_platform,
+
     route_name,
     route_designation,
     route_transport_mode_code,
     route_transport_mode,
     route_direction,
+
+    transport_category,
+
     origin_stop_id,
     origin_stop_name,
     destination_stop_id,
     destination_stop_name,
+
     trip_id,
     trip_start_date,
     trip_technical_number,
+
     agency_id,
     agency_name,
     agency_operator,
+
     stop_id,
     stop_name,
     stop_lat,
