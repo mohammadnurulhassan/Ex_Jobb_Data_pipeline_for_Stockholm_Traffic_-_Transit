@@ -1,0 +1,30 @@
+version: 2
+
+models:
+  - name: stg_trafiklab_departures
+    description: "Cleaned departure events from raw_trafiklab.trafiklab_departures"
+    columns:
+      - name: trip_id
+        tests: [not_null]
+      - name: stop_id
+        tests: [not_null]
+      - name: scheduled_time
+        tests: [not_null]
+
+  - name: stg_trafiklab_stops
+    description: "Distinct stops extracted from departures"
+    columns:
+      - name: stop_id
+        tests: [not_null, unique]
+
+  - name: stg_trafiklab_agencies
+    description: "Distinct agencies/operators extracted from departures"
+    columns:
+      - name: agency_id
+        tests: [not_null, unique]
+
+  - name: stg_trafiklab_routes
+    description: "Distinct routes extracted from departures"
+    columns:
+      - name: route_key
+        tests: [not_null, unique]

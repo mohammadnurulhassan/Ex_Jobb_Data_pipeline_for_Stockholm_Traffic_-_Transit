@@ -1,51 +1,130 @@
 -- fct_departure_delays.sql
--- delay নিয়ে analytics fact টেবিল, dashboard + ML ready
+-- Delay analytics fact table (dashboard + ML ready)
 
-with base as (
+with dep as (
 
     select
         departure_sk,
         scheduled_time,
         realtime_time,
         delay_seconds,
+        canceled,
+        is_realtime,
+
+        route_name,
         route_designation,
         route_transport_mode,
+        route_transport_mode_code,
+        route_direction,
         transport_category,
+
+        -- ✅ ADD THESE TWO LINES (this is the fix)
+        origin_stop_id,
+        destination_stop_id,
+
         stop_id,
-        stop_name
+        agency_id,
+
+        platform_designation
+
     from {{ ref('stg_trafiklab_departures') }}
+
+),
+
+stops as (
+
+    select
+        stop_id,
+        stop_name,
+        stop_lat,
+        stop_lon
+    from {{ ref('stg_trafiklab_stops') }}
+
+),
+
+routes as (
+
+    select
+        route_key,
+        route_name,
+        route_designation,
+        route_transport_mode,
+        route_transport_mode_code,
+        route_direction,
+        transport_category,
+        origin_stop_id,
+        destination_stop_id
+    from {{ ref('stg_trafiklab_routes') }}
+
+),
+
+agencies as (
+
+    select
+        agency_id,
+        agency_name,
+        agency_operator
+    from {{ ref('stg_trafiklab_agencies') }}
 
 ),
 
 enhanced as (
 
     select
-        departure_sk,
-        scheduled_time,
-        realtime_time,
-        delay_seconds,
+        d.departure_sk,
+        d.scheduled_time,
+        d.realtime_time,
+        d.delay_seconds,
+        d.canceled,
+        d.is_realtime,
 
-        route_designation,
-        route_transport_mode,
-        transport_category,
+        date(d.scheduled_time) as service_date,
+        cast(strftime(d.scheduled_time, '%H') as integer) as hour_of_day,
+        cast(strftime(d.scheduled_time, '%w') as integer) as day_of_week,
 
-        stop_id,
-        stop_name,
-
-        -- time dimensions
-        date(scheduled_time) as service_date,
-        strftime(scheduled_time, '%H')::integer as hour_of_day,
-        strftime(scheduled_time, '%w')::integer as day_of_week, -- 0=Sunday
-
-        -- delay flags
-        case 
-            when delay_seconds is null then null
-            when delay_seconds > 60 then 1
+        case
+            when d.delay_seconds is null then null
+            when d.delay_seconds > 60 then 1
             else 0
-        end as is_delayed
+        end as is_delayed,
 
-    from base
+        d.stop_id,
+        s.stop_name,
+        s.stop_lat,
+        s.stop_lon,
+
+        r.route_key,
+        coalesce(r.route_designation, d.route_designation) as route_designation,
+        coalesce(r.route_transport_mode, d.route_transport_mode) as route_transport_mode,
+        coalesce(r.transport_category, d.transport_category) as transport_category,
+        coalesce(r.route_direction, d.route_direction) as route_direction,
+
+        d.agency_id,
+        a.agency_name,
+        a.agency_operator,
+
+        d.platform_designation
+
+    from dep d
+    left join stops s
+        on d.stop_id = s.stop_id
+
+    left join routes r
+        on r.route_key = md5(
+            coalesce(d.route_name,'') || '|' ||
+            coalesce(d.route_designation,'') || '|' ||
+            coalesce(d.route_transport_mode,'') || '|' ||
+            coalesce(d.route_transport_mode_code,'') || '|' ||
+            coalesce(d.route_direction,'') || '|' ||
+            coalesce(d.origin_stop_id,'') || '|' ||
+            coalesce(d.destination_stop_id,'')
+        )
+
+    left join agencies a
+        on d.agency_id = a.agency_id
+
 )
 
 select *
 from enhanced
+
