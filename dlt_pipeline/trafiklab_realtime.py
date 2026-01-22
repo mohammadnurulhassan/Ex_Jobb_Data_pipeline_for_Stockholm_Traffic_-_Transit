@@ -21,7 +21,7 @@ load_dotenv()
 BASE_URL = "https://realtime-api.trafiklab.se/v1"
 
 # Stockholm C / T-Centralen (hub)
-DEFAULT_AREA_ID = "740000001"
+DEFAULT_AREA_ID = "740000001" ,"740000003" ,"740000002" ,"740000004" ,"740000005"
 
 # If you want a bit wider coverage, you can add more area ids here
 DEFAULT_AREA_IDS = [DEFAULT_AREA_ID]  # keep simple: only Stockholm C
