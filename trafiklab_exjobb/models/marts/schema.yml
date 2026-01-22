@@ -28,3 +28,38 @@ models:
         tests: [not_null]
       - name: transport_category
         tests: [not_null]
+    -name: mart_stop_kpis_daily
+    description: "Daily KPIs aggregated by stop + transport_category"
+    columns:
+      - name: service_date
+        tests: [not_null]
+      - name: stop_id
+        tests: [not_null]
+      - name: transport_category
+        tests: [not_null]
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [service_date, stop_id, transport_category]
+
+  - name: mart_route_kpis_daily
+    description: "Daily KPIs aggregated by route + transport_category"
+    columns:
+      - name: service_date
+        tests: [not_null]
+      - name: route_key
+        tests: [not_null]
+      - name: transport_category
+        tests: [not_null]
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [service_date, route_key, transport_category]
+  
+
+
+  - name: mart_timeseries_daily
+    description: "Daily timeseries base for forecasting/anomaly"
+    columns:
+      - name: service_date
+        tests: [not_null]
+      - name: transport_category
+        tests: [not_null]
