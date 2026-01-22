@@ -1,42 +1,51 @@
-{{ config(materialized="table") }}
+{{ config(materialized='table') }}
 
 with base as (
     select
         service_date,
         route_key,
-        route_name,
         route_designation,
+        route_transport_mode,
+        route_direction,
         transport_category,
-        departures_total,
-        departures_canceled,
-        avg_delay_seconds,
-        delay_rate,
-        on_time_rate
+        delay_seconds,
+        canceled,
+        is_realtime
     from {{ ref('fct_departure_delays') }}
+),
+
+agg as (
+    select
+        service_date,
+        route_key,
+
+        -- route_name does NOT exist in your dataset, so we keep a safe label:
+        any_value(route_designation) as route_designation,
+        any_value(route_transport_mode) as route_transport_mode,
+        any_value(route_direction) as route_direction,
+
+        coalesce(transport_category, 'UNKNOWN') as transport_category,
+
+        count(*) as departures_total,
+        sum(case when canceled then 1 else 0 end) as departures_canceled,
+
+        avg(coalesce(delay_seconds, 0)) as avg_delay_seconds,
+
+        -- delayed if > 60 seconds
+        avg(case when coalesce(delay_seconds, 0) > 60 then 1 else 0 end) as delay_rate,
+
+        -- on-time = not canceled AND delay <= 60
+        avg(case when (not canceled) and coalesce(delay_seconds, 0) <= 60 then 1 else 0 end) as on_time_rate,
+
+        -- realtime coverage
+        avg(case when is_realtime then 1 else 0 end) as realtime_coverage
+
+    from base
+    group by
+        service_date,
+        route_key,
+        coalesce(transport_category, 'UNKNOWN')
 )
 
-select
-    service_date,
-    route_key,
-    any_value(route_name) as route_name,
-    any_value(route_designation) as route_designation,
-    coalesce(transport_category, 'UNKNOWN') as transport_category,
+select * from agg
 
-    sum(departures_total) as departures_total,
-    sum(departures_canceled) as departures_canceled,
-
-    case when sum(departures_total) = 0 then null
-         else sum(avg_delay_seconds * departures_total) / sum(departures_total)
-    end as avg_delay_seconds,
-
-    case when sum(departures_total) = 0 then null
-         else sum(delay_rate * departures_total) / sum(departures_total)
-    end as delay_rate,
-
-    case when sum(departures_total) = 0 then null
-         else sum(on_time_rate * departures_total) / sum(departures_total)
-    end as on_time_rate
-
-from base
-group by 1,2,5
-;
