@@ -1,18 +1,6 @@
 version: 2
 
-sources:
-  - name: raw_traffic
-    description: Raw traffic data from Trafiklab API via DLT
-    database: stockholm_traffic
-    schema: raw_traffic
-    tables:
-      - name: realtime_departures
-        description: Real-time departure information
-        columns:
-          - name: station_id
-            description: Unique station identifier
-          - name: delay_minutes
-            description: Calculated delay in minutes
+
 
 models:
   - name: stg_departures

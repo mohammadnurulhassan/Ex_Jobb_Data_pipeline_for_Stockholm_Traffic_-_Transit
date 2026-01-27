@@ -27,6 +27,4 @@ models:
       +materialized: table
       +schema: analytics_marts     # or just 'marts'
 
-    raw:
-      +materialized: table
-      +schema: raw                 # optional
+                  # optional
