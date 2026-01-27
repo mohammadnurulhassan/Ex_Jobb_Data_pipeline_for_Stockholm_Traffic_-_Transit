@@ -1,6 +1,7 @@
-name: 'trafiklab_exjobb'
+name: 'tafiklab_exjobb'
 version: '1.0.0'
-profile: 'trafiklab_exjobb'
+config-version: 2
+profile: 'stockholm_traffic'
 
 model-paths: ["models"]
 analysis-paths: ["analyses"]
@@ -9,15 +10,19 @@ seed-paths: ["seeds"]
 macro-paths: ["macros"]
 snapshot-paths: ["snapshots"]
 
+target-path: "target"
 clean-targets:
   - "target"
   - "dbt_packages"
 
 models:
-  trafiklab_exjobb:
-    +schema: analytics
+  stockholm_traffic_analytics:
+    raw:
+      +materialized: table
     staging:
       +materialized: view
+      +schema: staging
     marts:
       +materialized: table
+      +schema: marts
 

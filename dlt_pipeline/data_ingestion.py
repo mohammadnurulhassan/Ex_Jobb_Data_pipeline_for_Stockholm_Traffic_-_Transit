@@ -2,7 +2,7 @@
 DLT ingestion: SL Transport API (replaces SL Departures v4)
 - Fetches realtime departures for selected Stockholm sites
 - Writes into ./warehouse/stockholm_traffic.duckdb (project root)
-- Keeps REALTIME_API_KEY in env (not used by SL Transport departures endpoint)
+- Keeps REALTIME_API_KEY in env
 """
 
 from __future__ import annotations
