@@ -1,0 +1,28 @@
+# Core Dependencies
+duckdb>=0.9.0
+pandas>=2.0.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# Data Pipeline
+dlt[duckdb]>=0.4.0
+
+# Visualization
+streamlit>=1.28.0
+plotly>=5.18.0
+
+# DBT
+dbt-core>=1.7.0
+dbt-duckdb>=1.7.0
+
+# ML (Optional)
+scikit-learn>=1.3.0
+numpy>=1.24.0
+joblib>=1.3.0
+
+# Orchestration (Optional)
+dagster>=1.5.0
+dagster-duckdb>=0.21.0
+
+# Utilities
+schedule>=1.2.0

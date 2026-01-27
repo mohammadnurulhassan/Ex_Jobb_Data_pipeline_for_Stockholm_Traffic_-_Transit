@@ -30,7 +30,7 @@ MART_ROUTE = f"{SCHEMA}.mart_route_kpis_daily"
 MART_TS = f"{SCHEMA}.mart_timeseries_daily"
 MART_FRESH = f"{SCHEMA}.mart_data_freshness"
 
-DEFAULT_CATEGORIES = ["ALL", "SL & Regional Bus", "Metro (Green/Red/Blue)", "Pendeltåg", "National Rail (SJ)", "Train (Other)"]
+DEFAULT_CATEGORIES = ["ALL", "SL BUS", "Metro (Green/Red/Blue)", "Pendeltåg", "Train (Other)"]
 
 
 # -----------------------------

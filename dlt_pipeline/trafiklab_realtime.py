@@ -355,12 +355,11 @@ if __name__ == "__main__":
     # If you want 4h backfill, set backfill_last_hours=4
     run_once(
     area_ids=[
-        "740000001",  # Stockholm C (SJ)
         "740000003",  # Slussen (Metro)
         "740000002",  # Gamla Stan (Metro)
         "740000004",  # Odenplan (Bus + Pendeltåg)
         "740000005",  # Stockholm Södra (Pendeltåg)
     ],
-    backfill_last_hours=4
+    backfill_last_hours=6
 )
 
