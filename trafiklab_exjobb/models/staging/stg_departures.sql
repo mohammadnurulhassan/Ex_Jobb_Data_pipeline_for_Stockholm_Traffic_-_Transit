@@ -27,7 +27,7 @@ base as (
         try_cast(s.ingestion_timestamp_utc as timestamptz) as ingestion_timestamp,
 
         try_cast(s.deviations_raw as varchar) as deviations_raw,
-        try_cast(s.has_deviation as boolean) as has_deviation,
+        try_cast(s.has_deviation as boolean) as has_deviation_raw,
 
         s._dlt_load_id,
         s._dlt_id
@@ -37,7 +37,6 @@ base as (
 
 features as (
     select
-        -- stable id (better than row_number)
         {{ dbt_utils.generate_surrogate_key([
             'cast(station_id as varchar)',
             'coalesce(stop_point_name, '''')',
@@ -63,14 +62,12 @@ features as (
         scheduled_datetime,
         ingestion_timestamp,
 
-        -- delay minutes (expected - scheduled)
         case
             when expected_datetime is not null and scheduled_datetime is not null
                 then date_diff('minute', scheduled_datetime, expected_datetime)
             else null
         end as delay_minutes,
 
-        -- choose your threshold (kept your >3 rule)
         case
             when expected_datetime is not null and scheduled_datetime is not null
                  and date_diff('minute', scheduled_datetime, expected_datetime) > 3
@@ -84,6 +81,12 @@ features as (
             when lower(deviations_raw) in ('[]', '', 'none', 'null') then null
             else deviations_raw
         end as deviation_text,
+
+        -- ✅ final has_deviation column (robust)
+        coalesce(
+            has_deviation_raw,
+            case when deviation_text is not null then true else false end
+        ) as has_deviation,
 
         extract(hour from expected_datetime) as departure_hour,
         extract(dow from expected_datetime)  as day_of_week,
@@ -106,6 +109,5 @@ features as (
 
 select *
 from features
--- optional: keep only realistic range, since you already use this in notebooks
 where delay_minutes between -10 and 60
 
