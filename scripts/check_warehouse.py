@@ -2,7 +2,7 @@ import duckdb
 from pathlib import Path
 
 # Path to your DuckDB warehouse file
-db_path = Path(__file__).resolve().parent.parent / "warehouse" / "trafiklab_realtime.duckdb"
+db_path = Path(__file__).resolve().parent.parent / "warehouse" / "stockholm_traffic.duckdb"
 print("Using DB:", db_path)
 
 con = duckdb.connect(str(db_path))

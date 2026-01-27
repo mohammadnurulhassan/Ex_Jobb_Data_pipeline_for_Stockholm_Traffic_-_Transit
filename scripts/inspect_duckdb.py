@@ -2,7 +2,7 @@ import duckdb
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = PROJECT_ROOT / "warehouse" / "trafiklab_realtime.duckdb"
+DB_PATH = PROJECT_ROOT / "warehouse" / "stockholm_traffic.duckdb"
 
 print("Using DuckDB file:", DB_PATH)
 
