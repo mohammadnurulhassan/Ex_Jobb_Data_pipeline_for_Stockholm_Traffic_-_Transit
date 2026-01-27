@@ -18,41 +18,29 @@ from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import os
+from config import (
+    DUCKDB_PATH,
+    DUCKDB_CREDENTIALS,
+    SL_TRANSPORT_BASE_URL,
+    STOCKHOLM_SITES,
+    RATE_LIMIT_DELAY_SECONDS,
+    API_TIMEOUT_SECONDS,
+    DLT_PIPELINE_NAME,
+    DLT_DESTINATION,
+    DLT_DATASET_NAME,
+    REALTIME_API_KEY,  # optional
+)
 
-# -----------------------------
-# ENV
-# -----------------------------
-load_dotenv()
-REALTIME_API_KEY = os.getenv("REALTIME_API_KEY")  # kept for project consistency (not used here)
 
-# -----------------------------
-# Paths (ensure warehouse/)
-# -----------------------------
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-WAREHOUSE_DIR = PROJECT_ROOT / "warehouse"
-WAREHOUSE_DIR.mkdir(parents=True, exist_ok=True)
 
-DUCKDB_PATH = WAREHOUSE_DIR / "stockholm_traffic.duckdb"
-DUCKDB_CREDENTIALS = f"duckdb:///{DUCKDB_PATH.as_posix()}"
-os.environ["DESTINATION__DUCKDB__CREDENTIALS"] = f"duckdb:///{DUCKDB_PATH.as_posix()}"
 
 # -----------------------------
 # SL Transport API (NEW)
 # -----------------------------
-BASE_URL = "https://transport.integration.sl.se/v1"
+BASE_URL = SL_TRANSPORT_BASE_URL
+STOCKHOLM_SITES = STOCKHOLM_SITES
 
-STOCKHOLM_SITES = {
-    9001: "T-Centralen",
-    9192: "Slussen",
-    9204: "Odenplan",
-    9302: "Fridhemsplan",
-    9303: "Kungsträdgården",
-    9506: "Södermalm",
-    1080: "Gullmarsplan",
-    9190: "Gamla Stan",
-    9191: "Medborgarplatsen",
-    1051: "Hötorget",
-}
+
 
 # -----------------------------
 # HTTP helpers
@@ -124,7 +112,8 @@ class SLTransportClient:
     def fetch_departures(self, site_id: int) -> List[Dict[str, Any]]:
         url = f"{BASE_URL}/sites/{site_id}/departures"
         try:
-            r = self.session.get(url, timeout=20)
+            r = self.session.get(url, timeout=API_TIMEOUT_SECONDS)
+            time.sleep(RATE_LIMIT_DELAY_SECONDS)
         except requests.exceptions.RequestException as e:
             print(f"   ❌ Request error for site {site_id}: {e}")
             return []
@@ -232,12 +221,12 @@ def run_dlt_pipeline():
         print("ℹ️  REALTIME_API_KEY not set (OK for SL Transport departures).")
 
     pipeline = dlt.pipeline(
-        pipeline_name="stockholm_traffic",
-        destination="duckdb",
-        dataset_name="raw_traffic",
+        pipeline_name=DLT_PIPELINE_NAME,
+        destination=DLT_DESTINATION,
+        dataset_name=DLT_DATASET_NAME,
         dev_mode=False,
     )
-
+    os.environ["DESTINATION__DUCKDB__CREDENTIALS"] = DUCKDB_CREDENTIALS
     load_info = pipeline.run([realtime_departures()])
 
     print("\n" + "=" * 70)
