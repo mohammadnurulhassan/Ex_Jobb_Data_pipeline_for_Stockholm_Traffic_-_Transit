@@ -5,7 +5,19 @@ DLT ingestion: SL Transport API (replaces SL Departures v4)
 - Keeps REALTIME_API_KEY in env
 """
 
+
 from __future__ import annotations
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# Ensure repo root is importable even when running this file directly
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
 
 import time
 from datetime import datetime, timezone

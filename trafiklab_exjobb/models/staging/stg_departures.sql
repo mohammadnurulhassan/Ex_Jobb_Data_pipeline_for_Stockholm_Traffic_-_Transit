@@ -101,5 +101,5 @@ features as (
 select *
 from features
 where delay_minutes between -10 and 60
-;
+
 
