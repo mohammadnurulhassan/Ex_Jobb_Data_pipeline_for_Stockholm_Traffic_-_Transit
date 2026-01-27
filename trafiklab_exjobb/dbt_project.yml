@@ -16,13 +16,17 @@ clean-targets:
   - "dbt_packages"
 
 models:
-  stockholm_traffic_analytics:
-    raw:
-      +materialized: table
+  tafiklab_exjobb:
+    +materialized: table  # default for everything unless overridden
+
     staging:
       +materialized: view
-      +schema: staging
+      +schema: analytics_staging   # or just 'staging' if you prefer
+
     marts:
       +materialized: table
-      +schema: marts
+      +schema: analytics_marts     # or just 'marts'
 
+    raw:
+      +materialized: table
+      +schema: raw                 # optional

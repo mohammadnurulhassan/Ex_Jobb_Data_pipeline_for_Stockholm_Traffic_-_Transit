@@ -1,0 +1,42 @@
+version: 2
+
+sources:
+  - name: raw_traffic
+    description: Raw traffic data from Trafiklab API via DLT
+    database: stockholm_traffic
+    schema: raw_traffic
+    tables:
+      - name: realtime_departures
+        description: Real-time departure information
+        columns:
+          - name: station_id
+            description: Unique station identifier
+          - name: delay_minutes
+            description: Calculated delay in minutes
+
+models:
+  - name: stg_departures
+    description: Cleaned and standardized departure data
+    columns:
+      - name: departure_id
+        description: Unique identifier for each departure
+        tests:
+          - not_null
+      - name: delay_minutes
+        description: Delay in minutes
+      - name: is_delayed
+        description: Boolean flag for delays > 3 minutes
+
+  - name: fact_hourly_delays
+    description: Hourly aggregated delay metrics
+    columns:
+      - name: hour
+        description: Hour timestamp
+      - name: avg_delay_minutes
+        description: Average delay in minutes
+
+  - name: fact_station_performance
+    description: Station-level performance metrics
+    
+  - name: fact_congestion_score
+    description: Calculated congestion scores
