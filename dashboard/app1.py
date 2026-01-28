@@ -1,6 +1,6 @@
 """
 FILE: dashboard/app.py
-Stockholm Traffic Analytics Dashboard (React V5 style, Streamlit implementation)
+Stockholm Traffic Analytics Dashboard - Streamlit Application
 
 Run:
   streamlit run dashboard/app.py
@@ -19,7 +19,8 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-
+from plotly.subplots import make_subplots
+import streamlit.components.v1 as components
 # ---------------------------------------------------------------------
 # ✅ Make project root importable (so `import config` works)
 # ---------------------------------------------------------------------
@@ -36,7 +37,7 @@ from config import DUCKDB_DATABASE, DLT_DATASET_NAME, STOCKHOLM_STATIONS
 # Page config
 # ---------------------------------------------------------------------
 st.set_page_config(
-    page_title="Stockholm Traffic — React V5 Style (Streamlit)",
+    page_title="Stockholm Traffic Analytics",
     page_icon="🚇",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -50,7 +51,7 @@ st.markdown(
 <style>
 /* background */
 .stApp {
-  background: radial-gradient(circle at 10% 10%, #0b1220 0%, #071022 35%, #060a1a 70%, #050816 100%);
+  background: radial-gradient(circle at 10%, #0b1220 0%, #071022 35%, #060a1a 70%, #050816 100%);
 }
 
 /* layout spacing */
@@ -299,7 +300,7 @@ def get_live_statistics() -> dict:
       MAX(ingestion_ts) AS last_update
     FROM base
     WHERE ingestion_ts IS NOT NULL
-      AND ingestion_ts >= current_timestamp - INTERVAL '15 minutes'
+      AND ingestion_ts >= current_timestamp - INTERVAL '5 minutes'
     """
 
     try:
@@ -413,30 +414,27 @@ def hero_header(live_points: int, last_update, auto_refresh: bool):
           <div>
             <div style="font-size:48px; font-weight:950; line-height:1;">Stockholm Traffic</div>
             <div style="font-size:18px; font-weight:800; color:rgba(255,255,255,0.85); margin-top:6px;">
-              AI Analytics Platform (Streamlit UI like React V5)
+              AI Analytics Platform for Real-Time Transit Insights
             </div>
           </div>
         </div>
         <div style="margin-top:14px;">
           <span class="r5-badge">{pulse}</span>
-          <span class="r5-badge">🗄️ Points: {live_points}</span>
           <span class="r5-badge">🎯 ML: 92.4%</span>
           <span class="r5-badge">⏱️ Update: {last_txt}</span>
-        </div>
-      </div>
-
-      <div style="min-width:260px;">
-        <div style="background: rgba(0,0,0,0.25); border:1px solid rgba(255,255,255,0.15); border-radius:16px; padding:14px;">
-          <div style="font-weight:900;">Auto refresh</div>
-          <div style="margin-top:8px; font-size:13px; opacity:0.9;">
-            {'Enabled ✅' if auto_refresh else 'Disabled ⛔'}
-          </div>
-        </div>
-      </div>
-
     </div>
-  </div>
-</div>
+      </div>
+
+<div style="min-width:260px;">
+    <div style="background: rgba(0,0,0,0.25); border:1px solid rgba(255,255,255,0.15); border-radius:16px; padding:14px;">
+        <div style="font-weight:900;">Auto refresh</div>
+            <div style="margin-top:8px; font-size:13px; opacity:0.9;">
+                {'Enabled ✅' if auto_refresh else 'Disabled ⛔'}
+            </div>
+         </div>
+    </div>
+    </div>
+     </div>
 """,
         unsafe_allow_html=True,
     )
@@ -526,17 +524,17 @@ def main():
 
     with col1:
         kpi_card(
-            "Avg Delay",
+            "🕒 Avg Delay ",
             f"{stats['avg_delay']:.1f}m",
-            "Last 15 min",
-            "#dc2626",
-            badge="HIGH" if stats["avg_delay"] > 6 else None,
+            "Last 10 min",
+            "#e02a2a",
+            badge="HIGH" if stats["avg_delay"] > 5 else None,
         )
     with col2:
         kpi_card(
             "Congestion",
             f"{stats.get('congestion_level', 0):.0f}%",
-            "Proxy score",
+            "Overall",
             "#ea580c",
             badge="PEAK" if stats.get("congestion_level", 0) > 75 else None,
         )
@@ -568,7 +566,7 @@ def main():
         kpi_card(
             "Efficiency",
             f"{eff:.0f}%",
-            "Energy (proxy)",
+            "Energy Usage",
             "#06b6d4",
         )
 
@@ -576,16 +574,16 @@ def main():
 
     # Environmental row (React-style)
     e1, e2, e3, e4 = st.columns(4)
-    with e1:
-        small_metric_card("CO2 Saved", "2340", "kg/day", "+12%", "#16a34a")
-    with e2:
-        small_metric_card("Energy", "87", "%", "+3%", "#2563eb")
-    with e3:
-        small_metric_card("Passengers", "290k", "daily", "+8%", "#8b5cf6")
-    with e4:
-        small_metric_card("Cars Replaced", "45k", "daily", "+15%", "#ea580c")
+    #with e1:
+        #small_metric_card("CO2 Saved", "2340", "kg/day", "+12%", "#16a34a")
+    #with e2:
+        #small_metric_card("Energy", "87", "%", "+3%", "#2563eb")
+    #with e3:
+        #small_metric_card("Passengers", "290k", "daily", "+8%", "#8b5cf6")
+    #with e4:
+        #small_metric_card("Cars Replaced", "45k", "daily", "+15%", "#ea580c")
 
-    st.write("")
+    #st.write("")
 
     # Tabs (React-like)
     home_tab, live_tab, forecast_tab, congestion_tab, stations_tab = st.tabs(
@@ -596,30 +594,110 @@ def main():
     with home_tab:
         left, right = st.columns([2, 1])
 
-        with left:
-            st.markdown('<div class="r5-card">', unsafe_allow_html=True)
-            st.markdown("### 24-Hour Pattern (from marts if available)")
+    # CSS (add once here, ok)
+    st.markdown(
+        """
+        <style>
+        .plot-card{
+            background: linear-gradient(180deg, rgba(30,41,59,0.85), rgba(15,23,42,0.85));
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 18px;
+            padding: 16px 16px 6px 16px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
 
-            hourly_df = get_hourly_trends(24)
-            if hourly_df.empty:
-                st.warning("No hourly mart data found. Ensure dbt built `analytics_analytics_marts.fact_hourly_delays`.")
-            else:
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=hourly_df["hour"], y=hourly_df["total_departures"],
-                    mode="lines+markers", name="Departures", fill="tozeroy"
-                ))
-                fig.add_trace(go.Scatter(
-                    x=hourly_df["hour"], y=hourly_df["avg_delay_minutes"],
-                    mode="lines+markers", name="Avg Delay (min)"
-                ))
-                fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10))
-                st.plotly_chart(fig, use_container_width=True)
+    with left:
+        st.markdown("### 24-Hour Pattern")
 
+        hourly_df = get_hourly_trends(24)
+
+        # Always define fig first (prevents UnboundLocalError)
+        fig = None
+
+        if hourly_df is None or hourly_df.empty:
+            st.warning(
+                "No hourly mart data found. Ensure dbt built `analytics_analytics_marts.fact_hourly_delays`."
+            )
+        else:
+            fig = go.Figure()
+
+            # Departures (area)
+            fig.add_trace(go.Scatter(
+                x=hourly_df["hour"],
+                y=hourly_df["total_departures"],
+                mode="lines+markers",
+                name="Departures",
+                line=dict(width=3, color="#22C55E"),   # green
+                marker=dict(size=7),
+                fill="tozeroy",
+                fillcolor="rgba(34, 197, 94, 0.18)",
+                hovertemplate="Hour: %{x}<br>Departures: %{y}<extra></extra>",
+                yaxis="y"
+            ))
+
+            # Avg delay (line) on secondary axis
+            fig.add_trace(go.Scatter(
+                x=hourly_df["hour"],
+                y=hourly_df["avg_delay_minutes"],
+                mode="lines+markers",
+                name="Avg Delay (min)",
+                line=dict(width=3, color="#60A5FA"),   # blue
+                marker=dict(size=7),
+                hovertemplate="Hour: %{x}<br>Avg delay: %{y:.2f} min<extra></extra>",
+                yaxis="y2"
+            ))
+
+            fig.update_layout(
+                template="plotly_dark",
+                height=420,
+                margin=dict(l=10, r=10, t=40, b=10),
+                hovermode="x unified",
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=1.02,
+                    xanchor="left",
+                    x=0
+                ),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                xaxis=dict(
+                    title="Hour",
+                    tickmode="linear",
+                    dtick=1,
+                    showgrid=False,
+                    zeroline=False
+                ),
+                yaxis=dict(
+                    title="Departures",
+                    gridcolor="rgba(255,255,255,0.08)",
+                    zeroline=False
+                ),
+                yaxis2=dict(
+                    title="Avg Delay (min)",
+                    overlaying="y",
+                    side="right",
+                    showgrid=False,
+                    zeroline=False
+                ),
+            )
+
+        # Render chart only if it was created
+        if fig is not None:
+            st.markdown('<div class="plot-card">', unsafe_allow_html=True)
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+                config={"responsive": True, "displayModeBar": False}
+            )
             st.markdown("</div>", unsafe_allow_html=True)
 
         with right:
-            st.markdown('<div class="r5-card">', unsafe_allow_html=True)
+            #st.markdown('<div class="r5-card">', unsafe_allow_html=True)
             st.markdown("### Top Stations (static until station mart is ready)")
 
             # If you have FACT_STATION you can replace this with real query later.
