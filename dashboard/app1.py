@@ -1,531 +1,310 @@
-f"""
-FILE 24: streamlit_app_v2.py
-Enhanced Streamlit Dashboard with 7-Day ML Predictions
-"""
+from __future__ import annotations
 
-import streamlit as st
+from pathlib import Path
+from datetime import datetime, timedelta
+
 import duckdb
 import pandas as pd
+import streamlit as st
 import plotly.express as px
-import plotly.graph_objects as go
-from datetime import datetime, timedelta
-import time
-from config import DUCKDB_DATABASE, STOCKHOLM_STATIONS
 
-# Page configuration
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def sql_escape(value: str) -> str:
+    """Escape single quotes for SQL string literals."""
+    return value.replace("'", "''")
+
+
+# -----------------------------
+# App config
+# -----------------------------
 st.set_page_config(
-    page_title="Stockholm Traffic Analytics with AI Predictions",
+    page_title="Stockholm Traffic Analytics",
     page_icon="🚇",
     layout="wide",
-    initial_sidebar_state="expanded"
 )
 
-# Custom CSS
-st.markdown("""
-    <style>
-    .main {padding: 0rem 1rem;}
-    .stMetric {background-color: #f0f2f6; padding: 15px; border-radius: 10px;}
-    h1 {color: #1f77b4;}
-    .prediction-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        padding: 20px;
-        border-radius: 10px;
-        margin: 10px 0;
-    }
-    </style>
-""", unsafe_allow_html=True)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DB_PATH = PROJECT_ROOT / "warehouse" / "stockholm_traffic.duckdb"
+
+STG = "analytics_analytics_staging.stg_departures"
+MART_HOURLY = "analytics_analytics_marts.fact_hourly_delays"
+MART_STATION = "analytics_analytics_marts.fact_station_performance"
+MART_CONG = "analytics_analytics_marts.fact_congestion_score"
+
 
 @st.cache_resource
-def get_db_connection():
-    try:
-        return duckdb.connect(DUCKDB_DATABASE, read_only=True)
-    except Exception as e:
-        st.error(f"Database connection error: {e}")
-        return None
+def get_con():
+    return duckdb.connect(str(DB_PATH), read_only=True)
+
 
 @st.cache_data(ttl=30)
-def get_live_statistics():
-    """Get real-time statistics"""
-    conn = get_db_connection()
-    if not conn:
-        return None
-    
-    try:
-        query = """
-            SELECT 
-                COUNT(*) as total_departures,
-                COUNT(DISTINCT station_id) as active_stations,
-                COUNT(DISTINCT line_number) as active_lines,
-                AVG(delay_minutes) as avg_delay,
-                MAX(delay_minutes) as max_delay,
-                SUM(CASE WHEN delay_minutes > 5 THEN 1 ELSE 0 END) as significant_delays,
-                SUM(CASE WHEN has_deviation THEN 1 ELSE 0 END) as active_disruptions,
-                MAX(ingestion_timestamp) as last_update
-            FROM raw_traffic.realtime_departures
-            WHERE ingestion_timestamp >= CURRENT_TIMESTAMP - INTERVAL '15 minutes'
-        """
-        result = conn.execute(query).fetchone()
-        
-        return {
-            'total_departures': result[0] or 0,
-            'active_stations': result[1] or 0,
-            'active_lines': result[2] or 0,
-            'avg_delay': result[3] or 0,
-            'max_delay': result[4] or 0,
-            'significant_delays': result[5] or 0,
-            'active_disruptions': result[6] or 0,
-            'last_update': result[7]
-        }
-    except Exception as e:
-        st.error(f"Error: {e}")
-        return None
+def get_station_list(con) -> list[str]:
+    df = con.execute(f"""
+        select distinct station_name
+        from {STG}
+        where station_name is not null
+        order by 1
+    """).fetchdf()
+    return df["station_name"].tolist()
 
-@st.cache_data(ttl=300)
-def get_predictions():
-    """Get 7-day predictions"""
-    conn = get_db_connection()
-    if not conn:
-        return pd.DataFrame()
-    
-    try:
-        query = """
-            SELECT *
-            FROM analytics.congestion_predictions
-            WHERE timestamp >= CURRENT_TIMESTAMP
-            ORDER BY timestamp
-        """
-        return conn.execute(query).df()
-    except:
-        return pd.DataFrame()
 
-@st.cache_data(ttl=60)
-def get_hourly_trends(hours=24):
-    """Get hourly trends"""
-    conn = get_db_connection()
-    if not conn:
-        return pd.DataFrame()
-    
-    try:
-        query = f"""
-            SELECT 
-                hour,
-                total_departures,
-                avg_delay_minutes,
-                delayed_departures,
-                delay_percentage
-            FROM analytics.fact_hourly_delays
-            WHERE hour >= CURRENT_TIMESTAMP - INTERVAL '{hours} hours'
-            ORDER BY hour
-        """
-        return conn.execute(query).df()
-    except:
-        return pd.DataFrame()
+@st.cache_data(ttl=30)
+def get_kpis(con, since_ts: str, station: str | None):
+    where = f"expected_datetime >= timestamptz '{since_ts}'"
+    if station and station != "All":
+        station_sql = sql_escape(station)
+        where += f" and station_name = '{station_sql}'"
 
-@st.cache_data(ttl=60)
-def get_congestion_data():
-    """Get congestion scores"""
-    conn = get_db_connection()
-    if not conn:
-        return pd.DataFrame()
-    
-    try:
-        query = """
-            SELECT 
-                hour,
-                station_name,
-                congestion_score,
-                congestion_level,
-                traffic_status,
-                avg_delay
-            FROM analytics.fact_congestion_score
-            WHERE hour >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
-            ORDER BY hour DESC
-        """
-        return conn.execute(query).df()
-    except:
-        return pd.DataFrame()
+    q = f"""
+    select
+      count(*) as departures,
+      avg(delay_minutes) as avg_delay,
+      quantile_cont(delay_minutes, 0.95) as p95_delay,
+      round(100.0 * sum(case when is_delayed then 1 else 0 end) / count(*), 2) as delayed_pct,
+      sum(case when has_deviation then 1 else 0 end) as deviations
+    from {STG}
+    where {where}
+      and delay_minutes is not null
+    """
+    return con.execute(q).fetchdf().iloc[0].to_dict()
 
-def main():
-    # Header
-    col1, col2, col3 = st.columns([2, 1, 1])
-    
-    with col1:
-        st.title("🚇 Stockholm Traffic Analytics")
-        st.markdown("**Real-time monitoring with AI-powered 7-day predictions**")
-    
-    with col2:
-        auto_refresh = st.checkbox("🔄 Auto-refresh (30s)", value=True)
-    
-    with col3:
-        if st.button("🔃 Refresh Now"):
-            st.cache_data.clear()
-            st.rerun()
-    
-    if auto_refresh:
-        time.sleep(0.1)
-        st.rerun()
-    
-    # Get data
-    stats = get_live_statistics()
-    
-    if not stats:
-        st.error("⚠️ Unable to connect to database!")
-        return
-    
-    # Last update info
-    if stats['last_update']:
-        last_update_time = pd.to_datetime(stats['last_update'])
-        time_diff = datetime.now() - last_update_time.replace(tzinfo=None)
-        seconds_ago = int(time_diff.total_seconds())
-        
-        if seconds_ago < 60:
-            update_text = f"{seconds_ago} seconds ago"
-        else:
-            update_text = f"{seconds_ago // 60} minutes ago"
-        
-        st.info(f"📡 Last data update: **{update_text}**")
-    
-    st.divider()
-    
-    # KPI Metrics
-    st.subheader("📊 Live Metrics (Last 15 Minutes)")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("Total Departures", f"{stats['total_departures']:,}", 
-                 f"{stats['active_stations']} stations")
-    
-    with col2:
-        st.metric("Average Delay", f"{stats['avg_delay']:.1f} min",
-                 f"Max: {stats['max_delay']:.0f} min", delta_color="inverse")
-    
-    with col3:
-        st.metric("Significant Delays", stats['significant_delays'],
-                 f"{(stats['significant_delays']/max(stats['total_departures'],1)*100):.1f}%",
-                 delta_color="inverse")
-    
-    with col4:
-        st.metric("Active Lines", stats['active_lines'],
-                 f"{stats['active_disruptions']} disruptions", delta_color="inverse")
-    
-    st.divider()
-    
-    # Main Tabs
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "🔮 7-Day Predictions",
-        "📈 Current Trends",
-        "📊 Congestion Analysis",
-        "🎯 Detailed Forecasts"
-    ])
-    
-    # Tab 1: Predictions Overview
-    with tab1:
-        st.subheader("🤖 AI-Powered 7-Day Congestion Forecast")
-        
-        predictions_df = get_predictions()
-        
-        if not predictions_df.empty:
-            # Check if predictions are recent
-            latest_pred = pd.to_datetime(predictions_df['generated_at'].iloc[0])
-            pred_age = datetime.now() - latest_pred.replace(tzinfo=None)
-            
-            if pred_age.total_seconds() < 86400:  # Less than 24 hours old
-                st.success(f"✅ Predictions generated {pred_age.total_seconds()/3600:.1f} hours ago")
-            else:
-                st.warning(f"⚠️ Predictions are {pred_age.days} days old. Run prediction job.")
-            
-            # Average prediction by day
-            predictions_df['date'] = pd.to_datetime(predictions_df['date'])
-            daily_avg = predictions_df.groupby('date')['predicted_congestion'].mean().reset_index()
-            
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=daily_avg['date'],
-                y=daily_avg['predicted_congestion'],
-                mode='lines+markers',
-                name='Predicted Congestion',
-                line=dict(color='#667eea', width=4),
-                marker=dict(size=10)
-            ))
-            fig.add_hline(y=50, line_dash="dash", line_color="orange",
-                         annotation_text="Moderate Congestion Threshold")
-            fig.add_hline(y=75, line_dash="dash", line_color="red",
-                         annotation_text="High Congestion Threshold")
-            
-            fig.update_layout(
-                title='7-Day Average Predicted Congestion',
-                xaxis_title='Date',
-                yaxis_title='Congestion Score (0-100)',
-                height=400,
-                hovermode='x unified'
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Prediction cards for next 3 days
-            st.subheader("📅 Next 3 Days Preview")
-            
-            next_3_days = predictions_df[
-                predictions_df['date'] <= predictions_df['date'].min() + timedelta(days=2)
-            ]
-            
-            days_grouped = next_3_days.groupby('date').agg({
-                'predicted_congestion': 'mean',
-                'congestion_level': lambda x: x.mode()[0] if not x.empty else 'Unknown'
-            }).reset_index()
-            
-            cols = st.columns(3)
-            for idx, row in days_grouped.iterrows():
-                with cols[idx]:
-                    date_str = row['date'].strftime('%A, %b %d')
-                    congestion = row['predicted_congestion']
-                    level = row['congestion_level']
-                    
-                    color = {
-                        'Low': 'green',
-                        'Moderate': 'orange',
-                        'High': 'red',
-                        'Critical': 'darkred'
-                    }.get(level, 'gray')
-                    
-                    st.markdown(f"""
-                        <div style="background: linear-gradient(135deg, {color}40 0%, {color}20 100%);
-                                    padding: 20px; border-radius: 10px; border-left: 4px solid {color};">
-                            <h4 style="margin: 0;">{date_str}</h4>
-                            <h2 style="margin: 10px 0;">{congestion:.0f}/100</h2>
-                            <p style="margin: 0;"><strong>{level}</strong> Congestion</p>
-                        </div>
-                    """, unsafe_allow_html=True)
-            
-            # Hourly heatmap
-            st.subheader("🗓️ Hourly Forecast Heatmap")
-            
-            pivot_df = predictions_df.pivot_table(
-                values='predicted_congestion',
-                index='station_name',
-                columns='date',
-                aggfunc='mean'
-            )
-            
-            fig = go.Figure(data=go.Heatmap(
-                z=pivot_df.values,
-                x=pivot_df.columns.strftime('%a %m/%d'),
-                y=pivot_df.index,
-                colorscale='RdYlGn_r',
-                zmid=50
-            ))
-            fig.update_layout(
-                title='Predicted Congestion by Station and Day',
-                xaxis_title='Date',
-                yaxis_title='Station',
-                height=500
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            
-        else:
-            st.warning("""
-                ⚠️ No predictions available yet.
-                
-                To generate predictions:
-                1. Ensure you have at least 30 days of data
-                2. Run: `python -m ml_models.congestion_predictor train`
-                3. Run: `python -m ml_models.congestion_predictor predict`
-                
-                Or use Dagster to automate this process.
-            """)
-    
-    # Tab 2: Current Trends
-    with tab2:
-        st.subheader("📈 Current Traffic Trends")
-        
-        hourly_df = get_hourly_trends(hours=24)
-        
-        if not hourly_df.empty:
-            fig1 = go.Figure()
-            fig1.add_trace(go.Scatter(
-                x=hourly_df['hour'],
-                y=hourly_df['total_departures'],
-                mode='lines+markers',
-                name='Departures',
-                line=dict(color='#1f77b4', width=3),
-                fill='tozeroy'
-            ))
-            fig1.update_layout(
-                title='Departures per Hour (Last 24h)',
-                xaxis_title='Hour',
-                yaxis_title='Departures',
-                height=400
-            )
-            st.plotly_chart(fig1, use_container_width=True)
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                fig2 = go.Figure()
-                fig2.add_trace(go.Scatter(
-                    x=hourly_df['hour'],
-                    y=hourly_df['avg_delay_minutes'],
-                    mode='lines+markers',
-                    name='Avg Delay',
-                    line=dict(color='#ff7f0e', width=3)
-                ))
-                fig2.update_layout(
-                    title='Average Delay Trend',
-                    xaxis_title='Hour',
-                    yaxis_title='Delay (min)',
-                    height=350
-                )
-                st.plotly_chart(fig2, use_container_width=True)
-            
-            with col2:
-                fig3 = go.Figure()
-                fig3.add_trace(go.Bar(
-                    x=hourly_df['hour'],
-                    y=hourly_df['delay_percentage'],
-                    name='Delay %',
-                    marker_color='#d62728'
-                ))
-                fig3.update_layout(
-                    title='Delay Percentage',
-                    xaxis_title='Hour',
-                    yaxis_title='Percentage',
-                    height=350
-                )
-                st.plotly_chart(fig3, use_container_width=True)
-    
-    # Tab 3: Congestion Analysis
-    with tab3:
-        st.subheader("📊 Current Congestion Analysis")
-        
-        congestion_df = get_congestion_data()
-        
-        if not congestion_df.empty:
-            # Current congestion by station
-            latest_congestion = congestion_df.groupby('station_name')['congestion_score'].last().sort_values(ascending=False)
-            
-            fig = px.bar(
-                x=latest_congestion.values,
-                y=latest_congestion.index,
-                orientation='h',
-                title='Current Congestion Score by Station',
-                color=latest_congestion.values,
-                color_continuous_scale='RdYlGn_r',
-                labels={'x': 'Congestion Score', 'y': 'Station'}
-            )
-            fig.update_layout(height=500)
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Congestion timeline
-            fig2 = px.line(
-                congestion_df,
-                x='hour',
-                y='congestion_score',
-                color='station_name',
-                title='Congestion Timeline (Last 24h)'
-            )
-            fig2.update_layout(height=400)
-            st.plotly_chart(fig2, use_container_width=True)
-    
-    # Tab 4: Detailed Forecasts
-    with tab4:
-        st.subheader("🎯 Detailed Station Forecasts")
-        
-        predictions_df = get_predictions()
-        
-        if not predictions_df.empty:
-            # Station selector
-            selected_station = st.selectbox(
-                "Select Station",
-                options=predictions_df['station_name'].unique()
-            )
-            
-            station_preds = predictions_df[
-                predictions_df['station_name'] == selected_station
-            ].copy()
-            
-            # 7-day hourly forecast
-            fig = go.Figure()
-            
-            for date in station_preds['date'].unique()[:7]:
-                day_data = station_preds[station_preds['date'] == date]
-                fig.add_trace(go.Scatter(
-                    x=day_data['hour'],
-                    y=day_data['predicted_congestion'],
-                    mode='lines+markers',
-                    name=pd.to_datetime(date).strftime('%a %m/%d')
-                ))
-            
-            fig.update_layout(
-                title=f'{selected_station} - 7-Day Hourly Forecast',
-                xaxis_title='Hour of Day',
-                yaxis_title='Predicted Congestion',
-                height=500
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Peak hours prediction
-            st.subheader("⚠️ Predicted Peak Congestion Hours")
-            
-            peak_hours = station_preds.nlargest(10, 'predicted_congestion')[
-                ['timestamp', 'hour', 'predicted_congestion', 'congestion_level']
-            ]
-            peak_hours['timestamp'] = pd.to_datetime(peak_hours['timestamp']).dt.strftime('%a %b %d, %H:%M')
-            
-            st.dataframe(
-                peak_hours,
-                column_config={
-                    "timestamp": "Date & Time",
-                    "hour": "Hour",
-                    "predicted_congestion": st.column_config.NumberColumn("Congestion", format="%.0f"),
-                    "congestion_level": "Level"
-                },
-                hide_index=True,
-                use_container_width=True
-            )
-    
-    # Sidebar
-    with st.sidebar:
-        st.header("⚙️ Dashboard Settings")
-        
-        st.divider()
-        
-        st.header("🤖 ML Model Info")
-        try:
-            import os
-            model_path = "ml_models/saved_models/congestion_predictor.pkl"
-            if os.path.exists(model_path):
-                model_time = datetime.fromtimestamp(os.path.getmtime(model_path))
-                model_age = datetime.now() - model_time
-                st.success(f"✅ Model trained {model_age.days} days ago")
-                st.caption(f"Last training: {model_time.strftime('%Y-%m-%d %H:%M')}")
-            else:
-                st.warning("⚠️ No trained model found")
-        except:
-            st.error("Error checking model")
-        
-        st.divider()
-        
-        st.header("📍 Monitored Stations")
-        for station_id, station_name in STOCKHOLM_STATIONS.items():
-            st.markdown(f"• {station_name}")
-        
-        st.divider()
-        
-        st.header("ℹ️ About")
-        st.markdown("""
-        **Features**:
-        - Real-time monitoring
-        - 7-day ML predictions
-        - Congestion analysis
-        - Station comparisons
-        
-        **Technology**:
-        - Random Forest ML
-        - DuckDB storage
-        - Streamlit interface
-        - Plotly visualizations
-        """)
 
-if __name__ == "__main__":
-    main()
+@st.cache_data(ttl=30)
+def get_hourly_series(con, since_ts: str, station: str | None):
+    where = f"hour >= timestamptz '{since_ts}'"
+    if station and station != "All":
+        station_sql = sql_escape(station)
+        where += f" and station_name = '{station_sql}'"
+
+    q = f"""
+    select
+      hour,
+      sum(total_departures) as total_departures,
+      avg(avg_delay_minutes) as avg_delay_minutes,
+      avg(delay_percentage) as delay_percentage
+    from {MART_HOURLY}
+    where {where}
+    group by 1
+    order by 1
+    """
+    return con.execute(q).fetchdf()
+
+
+@st.cache_data(ttl=30)
+def get_congestion_latest(con, station: str | None):
+    where = "1=1"
+    if station and station != "All":
+        station_sql = sql_escape(station)
+        where += f" and station_name = '{station_sql}'"
+
+    q = f"""
+    with latest as (
+      select max(hour) as max_hour
+      from {MART_CONG}
+      where {where}
+    )
+    select
+      c.*
+    from {MART_CONG} c
+    join latest l on c.hour = l.max_hour
+    where {where}
+    order by congestion_score desc
+    """
+    return con.execute(q).fetchdf()
+
+
+@st.cache_data(ttl=30)
+def get_station_hotspots(con, since_days: int = 7):
+    q = f"""
+    select
+      station_name,
+      total_departures,
+      avg_delay_minutes,
+      p95_delay_minutes,
+      overall_delay_rate,
+      deviation_rate
+    from {MART_STATION}
+    where last_departure >= current_timestamp - interval '{since_days} days'
+    order by p95_delay_minutes desc
+    limit 15
+    """
+    return con.execute(q).fetchdf()
+
+
+@st.cache_data(ttl=30)
+def get_delay_distribution(con, since_ts: str, station: str | None):
+    where = f"expected_datetime >= timestamptz '{since_ts}'"
+    if station and station != "All":
+        station_sql = sql_escape(station)
+        where += f" and station_name = '{station_sql}'"
+
+    q = f"""
+    select delay_minutes, transport_mode
+    from {STG}
+    where {where}
+      and delay_minutes between -10 and 60
+      and delay_minutes is not null
+    """
+    return con.execute(q).fetchdf()
+
+
+@st.cache_data(ttl=30)
+def get_stop_hotspots(con, since_ts: str, station: str | None):
+    where = f"expected_datetime >= timestamptz '{since_ts}'"
+    if station and station != "All":
+        station_sql = sql_escape(station)
+        where += f" and station_name = '{station_sql}'"
+
+    q = f"""
+    select
+      station_name,
+      stop_point_name,
+      count(*) as departures,
+      avg(delay_minutes) as avg_delay,
+      quantile_cont(delay_minutes, 0.95) as p95_delay,
+      round(100.0 * sum(case when is_delayed then 1 else 0 end) / count(*), 2) as delayed_pct
+    from {STG}
+    where {where}
+      and stop_point_name is not null
+      and delay_minutes is not null
+    group by 1,2
+    having count(*) >= 25
+    order by p95_delay desc
+    limit 20
+    """
+    return con.execute(q).fetchdf()
+
+
+# -----------------------------
+# Sidebar filters
+# -----------------------------
+st.title("🚇 Stockholm Traffic Analytics")
+
+con = get_con()
+
+with st.sidebar:
+    st.header("Filters")
+
+    if not DB_PATH.exists():
+        st.error(f"DuckDB not found: {DB_PATH}")
+        st.stop()
+
+    station_list = ["All"] + get_station_list(con)
+    station = st.selectbox("Station", station_list, index=0)
+
+    window = st.selectbox(
+        "Time window",
+        ["Last 1 hour", "Last 6 hours", "Last 24 hours", "Last 7 days"],
+        index=2,
+    )
+
+    now = datetime.now()
+    if window == "Last 1 hour":
+        since = now - timedelta(hours=1)
+    elif window == "Last 6 hours":
+        since = now - timedelta(hours=6)
+    elif window == "Last 24 hours":
+        since = now - timedelta(hours=24)
+    else:
+        since = now - timedelta(days=7)
+
+    since_ts = since.isoformat()
+    st.caption(f"DB: {DB_PATH}")
+
+
+# -----------------------------
+# KPIs
+# -----------------------------
+kpis = get_kpis(con, since_ts, station)
+
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Departures", f"{int(kpis['departures']):,}")
+c2.metric("Avg delay (min)", f"{(kpis['avg_delay'] or 0):.2f}")
+c3.metric("P95 delay (min)", f"{(kpis['p95_delay'] or 0):.2f}")
+c4.metric("Delayed (%)", f"{(kpis['delayed_pct'] or 0):.2f}")
+c5.metric("Deviations", f"{int(kpis['deviations'] or 0):,}")
+
+st.divider()
+
+# -----------------------------
+# Row 1: time series + congestion table
+# -----------------------------
+left, right = st.columns([2, 1])
+
+with left:
+    st.subheader("⏱️ Hourly trend")
+    df_ts = get_hourly_series(con, since_ts, station)
+    if df_ts.empty:
+        st.info("No data for selected window.")
+    else:
+        fig = px.line(df_ts, x="hour", y="avg_delay_minutes", markers=True)
+        fig.update_layout(xaxis_title="Hour", yaxis_title="Avg delay (min)")
+        st.plotly_chart(fig, use_container_width=True)
+
+with right:
+    st.subheader("🚦 Latest congestion snapshot")
+    df_cong = get_congestion_latest(con, station)
+    if df_cong.empty:
+        st.info("No congestion data yet.")
+    else:
+        show_cols = [
+            "station_name",
+            "hour",
+            "congestion_score",
+            "congestion_level",
+            "traffic_status",
+            "departure_count",
+            "delayed_vehicles",
+            "disruption_count",
+        ]
+        show_cols = [c for c in show_cols if c in df_cong.columns]
+        st.dataframe(df_cong[show_cols], use_container_width=True, height=420)
+
+st.divider()
+
+# -----------------------------
+# Row 2: delay distribution + stop hotspots
+# -----------------------------
+l2, r2 = st.columns(2)
+
+with l2:
+    st.subheader("📉 Delay distribution (-10 to +60)")
+    df_dist = get_delay_distribution(con, since_ts, station)
+    if df_dist.empty:
+        st.info("No delay records.")
+    else:
+        fig = px.histogram(df_dist, x="delay_minutes", nbins=40)
+        fig.update_layout(xaxis_title="Delay minutes", yaxis_title="Count")
+        st.plotly_chart(fig, use_container_width=True)
+
+with r2:
+    st.subheader("🔥 Stop-level hotspots (top p95)")
+    df_hot = get_stop_hotspots(con, since_ts, station)
+    if df_hot.empty:
+        st.info("No hotspot results.")
+    else:
+        fig = px.scatter(
+            df_hot,
+            x="avg_delay",
+            y="p95_delay",
+            size="departures",
+            hover_data=["station_name", "stop_point_name", "departures", "delayed_pct"],
+        )
+        fig.update_layout(xaxis_title="Avg delay", yaxis_title="P95 delay")
+        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(df_hot, use_container_width=True)
+
+st.divider()
+
+# -----------------------------
+# Row 3: station performance table
+# -----------------------------
+st.subheader("🏁 Station performance (last 7 days, from marts)")
+df_station = get_station_hotspots(con, since_days=7)
+if df_station.empty:
+    st.info("No station performance table yet.")
+else:
+    st.dataframe(df_station, use_container_width=True)
