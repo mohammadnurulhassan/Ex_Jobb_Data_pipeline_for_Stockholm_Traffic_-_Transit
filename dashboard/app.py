@@ -1,556 +1,473 @@
+"""
+FILE: dashboard/app.py
+Stockholm Traffic Analytics Dashboard (Aligned with dagster_app.py + config.py)
+
+Fixes:
+- Ensures project root is on sys.path so `import config` works when running from /dashboard.
+
+Run:
+  streamlit run dashboard/app.py
+"""
+
 from __future__ import annotations
 
+import os
+import sys
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
-from datetime import date
+
 import duckdb
 import pandas as pd
-import numpy as np
 import streamlit as st
 import plotly.express as px
-
-
-# -----------------------------
-# Config
-# -----------------------------
-st.set_page_config(
-    page_title="Stockholm Mobility Dashboard",
-    layout="wide",
-)
-st.markdown("""
-<style>
-/* tighter page like your screenshot */
-.block-container { padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1200px; }
-
-/* chart card */
-.chart-card {
-  background: #ffffff;
-  border: 1px solid #eef2f7;
-  border-radius: 18px;
-  padding: 18px 18px 6px 18px;
-  box-shadow: 0 1px 2px rgba(16,24,40,0.04);
-}
-.chart-title {
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: .12em;
-  text-transform: uppercase;
-  color: #94a3b8;
-  margin: 0 0 10px 4px;
-}
-</style>
-""", unsafe_allow_html=True)
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DB_PATH = PROJECT_ROOT / "warehouse" / "trafiklab_realtime.duckdb"
-
-SCHEMA = "analytics_analytics"
-FCT = f"{SCHEMA}.fct_departure_delays"
-MART_DAILY = f"{SCHEMA}.mart_mobility_kpis_daily"
-MART_HOURLY = f"{SCHEMA}.mart_mobility_kpis_hourly"
-MART_STOP = f"{SCHEMA}.mart_stop_kpis_daily"
-MART_ROUTE = f"{SCHEMA}.mart_route_kpis_daily"
-MART_TS = f"{SCHEMA}.mart_timeseries_daily"
-MART_FRESH = f"{SCHEMA}.mart_data_freshness"
-
-DEFAULT_CATEGORIES = ["ALL", "SL BUS", "Metro (Green/Red/Blue)", "Pendeltåg", "Train (Other)"]
-
-
-# -----------------------------
-# DuckDB helpers
-# -----------------------------
-@st.cache_resource
-def get_con() -> duckdb.DuckDBPyConnection:
-    return duckdb.connect(str(DB_PATH), read_only=True)
-
-
-def q(sql: str, params: list | None = None) -> pd.DataFrame:
-    con = get_con()
-    if params:
-        return con.execute(sql, params).df()
-    return con.execute(sql).df()
-
-
-def fmt_int(x) -> str:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return "-"
-    return f"{int(x):,}"
-
-
-def fmt_pct(x) -> str:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return "-"
-    return f"{x*100:.1f}%"
-
-
-def fmt_min_from_seconds(x) -> str:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return "-"
-    return f"{(x/60):.1f} min"
-
-
-# -----------------------------
-# Data freshness
-# -----------------------------
-def load_freshness() -> dict:
-    df = q(f"select * from {MART_FRESH} limit 1;")
-    if df.empty:
-        return {"latest_response_timestamp": "-", "minutes_since_last_update": "-"}
-    return {
-        "latest_response_timestamp": str(df.loc[0, "latest_response_timestamp"]),
-        "minutes_since_last_update": int(df.loc[0, "minutes_since_last_update"]),
-    }
-
-
-# -----------------------------
-# Filters
-# -----------------------------
-def available_service_dates() -> list[str]:
-    df = q(f"select distinct service_date from {MART_DAILY} order by service_date desc;")
-    return [str(x) for x in df["service_date"].tolist()] if not df.empty else []
-
-
-def sidebar_filters() -> tuple[str, str]:
-    st.sidebar.markdown("### ⚙️ Filters")
-
-    dates = available_service_dates()
-    selected_date = st.sidebar.selectbox(
-        "Service date",
-        options=dates,
-        index=0 if dates else None,
-    )
-
-    transport_category = st.sidebar.radio(
-        "Transport category",
-        options=DEFAULT_CATEGORIES,
-        index=0,
-        help="Choose a mode to filter KPIs/plots. 'ALL' shows everything together.",
-    )
-
-    st.sidebar.divider()
-    st.sidebar.code("streamlit run dashboard/app.py", language="bash")
-    st.sidebar.caption("Trafiklab.se Data License CC-BY")
-    return selected_date, transport_category
-
-
-def where_category(alias: str, category: str) -> tuple[str, list]:
-    if not category or category == "ALL":
-        return "1=1", []
-    return f"{alias}.transport_category = ?", [category]
-
-
-# -----------------------------
-# KPIs + Charts
-# -----------------------------
-def load_last_4h_kpis(category: str) -> dict:
-    cond, params = where_category("f", category)
-
-    sql = f"""
-    with base as (
-      select *
-      from {FCT} f
-      where {cond}
-        and f.response_timestamp >= (now() - interval 4 hour)
-    )
-    select
-      count(*) as departures_total,
-      sum(case when canceled then 1 else 0 end) as departures_canceled,
-      avg(case when canceled then null else delay_seconds end) as avg_delay_seconds,
-      avg(case when canceled then null else case when coalesce(delay_seconds,0) > 60 then 1 else 0 end end) as delay_rate,
-      avg(case when canceled then null else case when coalesce(delay_seconds,0) <= 60 then 1 else 0 end end) as on_time_rate
-    from base;
-    """
-    df = q(sql, params)
-    if df.empty:
-        return {}
-    return df.iloc[0].to_dict()
-
-
-def load_last_7d_summary(selected_date: str, category: str) -> dict:
-    cond, params = where_category("d", category)
-
-    sql = f"""
-    with d as (
-      select *
-      from {MART_DAILY} d
-      where {cond}
-        and d.service_date between (?::date - interval 6 day) and ?::date
-    )
-    select
-      sum(departures_total) as departures_7d,
-      avg(avg_delay_seconds) as avg_delay_seconds_7d,
-      avg(on_time_rate) as on_time_rate_7d
-    from d;
-    """
-    df = q(sql, params + [selected_date, selected_date])
-    if df.empty:
-        return {}
-    return df.iloc[0].to_dict()
-
-
-def load_peak_delay_hour(selected_date: str, category: str) -> dict:
-    cond, params = where_category("h", category)
-    sql = f"""
-    select
-      hour_of_day,
-      avg_delay_seconds
-    from {MART_HOURLY} h
-    where {cond}
-      and h.service_date = ?::date
-    order by avg_delay_seconds desc
-    limit 1;
-    """
-    df = q(sql, params + [selected_date])
-    if df.empty:
-        return {"hour_of_day": None, "avg_delay_seconds": None}
-    return df.iloc[0].to_dict()
-
-
 import plotly.graph_objects as go
 
-def fig_hourly_delay(selected_date: str, category: str):
-    cond, params = where_category("h", category)
-    sql = f"""
-    select hour_of_day, avg_delay_seconds
-    from {MART_HOURLY} h
-    where {cond}
-      and h.service_date = ?::date
-    order by hour_of_day;
-    """
-    df = q(sql, params + [selected_date])
-    if df.empty:
-        return None
+# ---------------------------------------------------------------------
+# ✅ Make project root importable (so `import config` works)
+# dashboard/app.py -> repo root is parents[1]
+# ---------------------------------------------------------------------
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=df["hour_of_day"],
-        y=df["avg_delay_seconds"],
-        mode="lines+markers",
-        line=dict(width=3, shape="spline"),   # smooth like screenshot
-        marker=dict(size=8),
-        hovertemplate="Hour=%{x}<br>Delay=%{y:.0f}s<extra></extra>",
-        name="Delay"
-    ))
+# ---------------------------------------------------------------------
+# ✅ Single source of truth (config.py in project root)
+# ---------------------------------------------------------------------
+from config import DUCKDB_DATABASE, DLT_DATASET_NAME, STOCKHOLM_STATIONS
 
-    fig.update_layout(
-        height=320,
-        margin=dict(l=30, r=20, t=10, b=30),
-        paper_bgcolor="white",
-        plot_bgcolor="white",
-        showlegend=False,
-        xaxis=dict(
-            title="",
-            showline=False,
-            zeroline=False,
-            tickfont=dict(size=10, color="#64748b"),
-            gridcolor="#eef2f7"
-        ),
-        yaxis=dict(
-            title="",
-            showline=False,
-            zeroline=False,
-            tickfont=dict(size=10, color="#64748b"),
-            gridcolor="#eef2f7"
-        ),
-    )
-    return fig
-
-
-
-def fig_hourly_on_time(selected_date: str, category: str):
-    cond, params = where_category("h", category)
-    sql = f"""
-    select hour_of_day, on_time_rate
-    from {MART_HOURLY} h
-    where {cond}
-      and h.service_date = ?::date
-    order by hour_of_day;
-    """
-    df = q(sql, params + [selected_date])
-    if df.empty:
-        return None
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=df["hour_of_day"],
-        y=df["on_time_rate"],
-        mode="lines+markers",
-        line=dict(width=3, shape="spline"),
-        marker=dict(size=7),
-        hovertemplate="Hour=%{x}<br>On-time=%{y:.1%}<extra></extra>",
-        name="On-time"
-    ))
-
-    fig.update_layout(
-        height=320,
-        margin=dict(l=30, r=20, t=10, b=30),
-        paper_bgcolor="white",
-        plot_bgcolor="white",
-        showlegend=False,
-        xaxis=dict(
-            title="",
-            showline=False,
-            zeroline=False,
-            tickfont=dict(size=10, color="#64748b"),
-            gridcolor="#eef2f7"
-        ),
-        yaxis=dict(
-            title="",
-            showline=False,
-            zeroline=False,
-            tickfont=dict(size=10, color="#64748b"),
-            gridcolor="#eef2f7",
-            range=[0, 1]
-        ),
-    )
-    return fig
-
-
-
-# -----------------------------
-# Stops + Routes
-# -----------------------------
-def load_top_stops(selected_date: str, category: str) -> pd.DataFrame:
-    cond, params = where_category("s", category)
-    sql = f"""
-    select
-      service_date,
-      stop_id,
-      stop_name,
-      transport_category,
-      departures_total,
-      on_time_rate,
-      avg_delay_seconds,
-      delay_rate
-    from {MART_STOP} s
-    where {cond}
-      and s.service_date = ?::date
-    order by avg_delay_seconds desc, departures_total desc
-    limit 25;
-    """
-    return q(sql, params + [selected_date])
-
-
-def load_top_routes(selected_date: str, category: str) -> pd.DataFrame:
-    cond, params = where_category("r", category)
-    sql = f"""
-    select
-      service_date,
-      route_key,
-      route_designation,
-      route_transport_mode,
-      route_direction,
-      transport_category,
-      departures_total,
-      on_time_rate,
-      avg_delay_seconds,
-      delay_rate
-    from {MART_ROUTE} r
-    where {cond}
-      and r.service_date = ?::date
-    order by avg_delay_seconds desc, departures_total desc
-    limit 25;
-    """
-    return q(sql, params + [selected_date])
-
-
-# -----------------------------
-# Forecast
-# -----------------------------
-def build_next_day_prediction(selected_date: str, category: str) -> pd.DataFrame:
-    cond, params = where_category("t", category)
-    sql = f"""
-    select service_date, departures_total
-    from {MART_TS} t
-    where {cond}
-      and t.service_date between (?::date - interval 13 day) and ?::date
-    order by service_date;
-    """
-    df = q(sql, params + [selected_date, selected_date])
-    if df.empty:
-        return df
-
-    df["service_date"] = pd.to_datetime(df["service_date"])
-    df["ma7"] = df["departures_total"].rolling(7, min_periods=1).mean()
-
-    next_day = df["service_date"].max() + pd.Timedelta(days=1)
-    pred = float(df["ma7"].iloc[-1])
-
-    out = df[["service_date", "departures_total"]].copy()
-    out["type"] = "actual"
-    out2 = pd.DataFrame({"service_date": [next_day], "departures_total": [pred], "type": ["prediction"]})
-    return pd.concat([out, out2], ignore_index=True)
-
-
-def fig_forecast(df_pred: pd.DataFrame, category: str):
-    if df_pred.empty:
-        return None
-    title = f"Mobility Forecast (Next Day) — {category if category!='ALL' else 'ALL modes'}"
-    fig = px.line(df_pred, x="service_date", y="departures_total", color="type", markers=True, title=title)
-    fig.update_layout(xaxis_title="Date", yaxis_title="Departures")
-    return fig
-
-
-# -----------------------------
-# UI (React-like single page)
-# -----------------------------
-fresh = load_freshness()
-selected_date, category = sidebar_filters()
-
-# Header block (similar vibe)
-st.markdown("# 🚇 Stockholm Mobility Dashboard")
-st.caption(
-    f"Freshness: {fresh['latest_response_timestamp']}  •  minutes_since_update={fresh['minutes_since_last_update']}  •  Live Updates Active"
+# ---------------------------------------------------------------------
+# Page config + styling
+# ---------------------------------------------------------------------
+st.set_page_config(
+    page_title="Stockholm Traffic Analytics ",
+    page_icon="🚇",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
-st.write(f"Showing data for category: **{category}** on **{selected_date}**")
 
-# Status pill row
-c_status, c_dl = st.columns([0.85, 0.15], vertical_alignment="center")
-with c_status:
-    st.markdown("**Status:** 🟠 Running…")
-with c_dl:
-    st.download_button(
-        "Download (Stops CSV)",
-        data=b"",
-        disabled=True,
-        help="Enabled after loading stops table below."
+st.markdown(
+    """
+<style>
+    .main {padding: 0rem 1rem;}
+    .stMetric {background-color: #f0f2f6; padding: 15px; border-radius: 10px;}
+    h1 {color: #1f77b4;}
+    .prediction-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 20px;
+        border-radius: 10px;
+        margin: 10px 0;
+    }
+    </style>
+""", unsafe_allow_html=True,
+)
+
+# ---------------------------------------------------------------------
+# Schemas/tables aligned with dagster_app.py
+# ---------------------------------------------------------------------
+RAW_SCHEMA = DLT_DATASET_NAME  # usually "raw_traffic"
+MART_SCHEMA = "analytics_analytics_marts"
+
+FACT_HOURLY = f"{MART_SCHEMA}.fact_hourly_delays"
+FACT_CONGESTION = f"{MART_SCHEMA}.fact_congestion_score"
+FACT_STATION = f"{MART_SCHEMA}.fact_station_performance"
+
+# Optional predictions: if you later materialize into DuckDB, set env var
+# Example: set PREDICTIONS_TABLE=analytics_analytics_marts.congestion_predictions
+PREDICTIONS_TABLE = os.getenv("PREDICTIONS_TABLE", "").strip()
+
+# Fallback CSV produced by your Dagster ML asset
+PROJECT_ROOT = REPO_ROOT
+PREDICTIONS_CSV_FALLBACK = PROJECT_ROOT / "predictions_sample.csv"
+MODEL_PATH = PROJECT_ROOT / "ml_models" / "saved_models" / "congestion_predictor.pkl"
+
+
+# =============================================================================
+# DuckDB helpers
+# =============================================================================
+@st.cache_resource
+def get_db_connection() -> duckdb.DuckDBPyConnection | None:
+    try:
+        return duckdb.connect(DUCKDB_DATABASE, read_only=True)
+    except Exception as e:
+        st.error(f"Database connection error: {e}")
+        return None
+
+
+def table_exists(con: duckdb.DuckDBPyConnection, full_name: str) -> bool:
+    if "." not in full_name:
+        return False
+    schema, name = full_name.split(".", 1)
+    q = """
+    SELECT 1
+    FROM information_schema.tables
+    WHERE table_schema = ? AND table_name = ?
+    LIMIT 1
+    """
+    try:
+        return con.execute(q, [schema, name]).fetchone() is not None
+    except Exception:
+        return False
+
+
+def safe_df(con: duckdb.DuckDBPyConnection, query: str) -> pd.DataFrame:
+    try:
+        return con.execute(query).fetchdf()
+    except Exception:
+        return pd.DataFrame()
+
+
+def find_raw_table(con: duckdb.DuckDBPyConnection, schema: str) -> str | None:
+    df = safe_df(
+        con,
+        f"""
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = '{schema}'
+          AND table_type IN ('BASE TABLE','VIEW')
+        ORDER BY table_name
+        """,
     )
+    if df.empty:
+        return None
 
-st.divider()
+    names = df["table_name"].tolist()
+    for n in names:
+        if "depart" in n.lower():
+            return f"{schema}.{n}"
+    return f"{schema}.{names[0]}"
 
-# --- SECTION 1: KPIs (Last 4h)
-st.subheader("⏱️ Real-time Performance (Last 4h)")
 
-k4 = load_last_4h_kpis(category)
-kpi_cols = st.columns(5)
-
-kpi_cols[0].metric("Departures", fmt_int(k4.get("departures_total")), help="Last 4 hours")
-kpi_cols[1].metric("On-time Rate", fmt_pct(k4.get("on_time_rate")), help="≤ 60 seconds")
-kpi_cols[2].metric("Avg Delay", fmt_min_from_seconds(k4.get("avg_delay_seconds")), help="Network avg")
-kpi_cols[3].metric("Delay Rate", fmt_pct(k4.get("delay_rate")), help="> 60 seconds")
-kpi_cols[4].metric("Canceled", fmt_int(k4.get("departures_canceled")), help="Last 4 hours")
-
-# --- 7d context (like your React)
-st.markdown("### 7-day Context")
-
-s7 = load_last_7d_summary(selected_date, category)
-c1, c2, c3 = st.columns(3)
-c1.metric("Departures (7d total)", fmt_int(s7.get("departures_7d")))
-c2.metric("Avg delay (7d)", fmt_min_from_seconds(s7.get("avg_delay_seconds_7d")))
-c3.metric("On-time rate (7d)", fmt_pct(s7.get("on_time_rate_7d")))
-
-peak = load_peak_delay_hour(selected_date, category)
-if peak.get("hour_of_day") is not None:
-    st.info(
-        f"Peak delay detected on **{selected_date}** at **{peak.get('hour_of_day')}** "
-        f"with avg delay **{fmt_min_from_seconds(peak.get('avg_delay_seconds'))}** for **{category}**."
+def get_columns(con: duckdb.DuckDBPyConnection, full_name: str) -> set[str]:
+    if "." not in full_name:
+        return set()
+    schema, table = full_name.split(".", 1)
+    df = safe_df(
+        con,
+        f"""
+        SELECT lower(column_name) AS col
+        FROM information_schema.columns
+        WHERE table_schema = '{schema}'
+          AND table_name = '{table}'
+        """,
     )
+    return set(df["col"].tolist()) if not df.empty else set()
 
-# Charts row
-colA, colB = st.columns(2)
-with colA:
-    fig1 = fig_hourly_delay(selected_date, category)
-    if fig1 is not None:
-        st.plotly_chart(fig1, use_container_width=True)
-    else:
-        st.warning("No hourly delay data for this selection/date.")
-with colB:
-    fig2 = fig_hourly_on_time(selected_date, category)
-    if fig2 is not None:
-        st.plotly_chart(fig2, use_container_width=True)
-    else:
-        st.warning("No hourly on-time data for this selection/date.")
 
-st.divider()
+def human_age(ts) -> str:
+    if ts is None:
+        return "unknown"
+    try:
+        dt = pd.to_datetime(ts).to_pydatetime()
+        diff = datetime.now() - dt.replace(tzinfo=None)
+        sec = int(diff.total_seconds())
+        if sec < 60:
+            return f"{sec}s ago"
+        if sec < 3600:
+            return f"{sec // 60}m ago"
+        return f"{sec // 3600}h ago"
+    except Exception:
+        return "unknown"
 
-# --- SECTION 2: Granular Delay Analysis (Stops + Routes)
-st.subheader("📍 Granular Delay Analysis")
 
-df_stops = load_top_stops(selected_date, category)
-df_routes = load_top_routes(selected_date, category)
+# =============================================================================
+# Data fetchers
+# =============================================================================
+@st.cache_data(ttl=30)
+def get_live_statistics():
+    """Get real-time statistics"""
+    con = get_db_connection()
+    if not con:
+        return None
 
-g1, g2 = st.columns(2)
+    raw_table = find_raw_table(con, RAW_SCHEMA)
+    if not raw_table:
+        return {"__error__": f"No tables found in schema `{RAW_SCHEMA}`. Run DLT/Dagster ingestion first."}
 
-with g1:
-    st.markdown(f"#### Worst Delay Stops ({category})")
-    if df_stops.empty:
-        st.warning("No stop KPI data found for this selection/date.")
-    else:
-        fig = px.bar(
-            df_stops.sort_values("avg_delay_seconds", ascending=True),
-            x="avg_delay_seconds",
-            y="stop_name",
-            orientation="h",
-            title=None,
-            hover_data=["departures_total", "on_time_rate", "delay_rate", "transport_category"],
-        )
-        fig.update_layout(xaxis_title="Avg delay (s)", yaxis_title="")
-        st.plotly_chart(fig, use_container_width=True)
+    cols = get_columns(con, raw_table)
+    if not cols:
+        return {"__error__": f"Could not read columns for `{raw_table}`"}
 
-with g2:
-    st.markdown("#### Critical Routes by Delay Volume")
-    if df_routes.empty:
-        st.warning("No route KPI data found for this selection/date.")
-    else:
-        # choose top 3 worst avg delay, similar to your mock's “critical routes”
-        top3 = df_routes.sort_values(["avg_delay_seconds", "departures_total"], ascending=[False, False]).head(3)
-        fig = px.bar(
-            top3.sort_values("avg_delay_seconds", ascending=True),
-            x="avg_delay_seconds",
-            y="route_designation",
-            orientation="h",
-            title=None,
-            hover_data=["departures_total", "on_time_rate", "delay_rate", "route_direction", "transport_category"],
-        )
-        fig.update_layout(xaxis_title="Avg delay (s)", yaxis_title="")
-        st.plotly_chart(fig, use_container_width=True)
+    ts_candidates = ["ingestion_timestamp_utc", "ingestion_timestamp", "ingestion_ts", "timestamp", "created_at"]
+    site_candidates = ["site_id", "station_id"]
+    line_candidates = ["line", "line_number", "linenumber"]
+    delay_candidates = ["delay_minutes", "delay", "delay_mins", "avg_delay_minutes"]
+    dev_candidates = ["has_deviation", "deviation", "is_deviation"]
 
-# Detailed stop table + download
-if not df_stops.empty:
-    st.markdown(f"#### Detailed Stop KPIs — {category}")
-    df_stop_view = df_stops[[
-        "stop_name",
-        "transport_category",
-        "departures_total",
-        "avg_delay_seconds",
-        "on_time_rate",
-        "delay_rate",
-    ]].copy()
+    def pick(cands: list[str]) -> str | None:
+        for c in cands:
+            if c in cols:
+                return c
+        return None
 
-    df_stop_view = df_stop_view.rename(columns={
-        "stop_name": "Stop Name",
-        "transport_category": "Category",
-        "departures_total": "Departures",
-        "avg_delay_seconds": "Avg Delay (s)",
-        "on_time_rate": "On-time",
-        "delay_rate": "Delay Rate",
-    })
+    ts_col = pick(ts_candidates)
+    site_col = pick(site_candidates)
+    line_col = pick(line_candidates)
+    delay_col = pick(delay_candidates)
+    dev_col = pick(dev_candidates)
 
-    df_stop_view["Departures"] = df_stop_view["Departures"].map(lambda x: int(x) if pd.notnull(x) else x)
-    df_stop_view["On-time"] = df_stop_view["On-time"].map(lambda x: f"{x:.0%}" if pd.notnull(x) else "-")
-    df_stop_view["Delay Rate"] = df_stop_view["Delay Rate"].map(lambda x: f"{x:.0%}" if pd.notnull(x) else "-")
-    df_stop_view["Avg Delay (s)"] = df_stop_view["Avg Delay (s)"].map(lambda x: round(float(x), 1) if pd.notnull(x) else x)
+    if ts_col is None:
+        return {"__error__": f"No timestamp column found in `{raw_table}`. Columns: {sorted(list(cols))[:40]}..."}
 
-    st.dataframe(df_stop_view, use_container_width=True, hide_index=True)
+    ts_expr = f"try_cast({ts_col} as timestamptz)"
+    delay_expr = f"coalesce(try_cast({delay_col} as double), 0)" if delay_col else "0.0"
+    site_expr = f"try_cast({site_col} as bigint)" if site_col else "NULL"
+    line_expr = f"cast({line_col} as varchar)" if line_col else "NULL"
+    dev_expr = f"coalesce(try_cast({dev_col} as boolean), false)" if dev_col else "false"
 
-    csv_bytes = df_stop_view.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇️ Download stop KPIs (CSV)",
-        data=csv_bytes,
-        file_name=f"stop_kpis_{category.replace(' ', '_')}_{selected_date}.csv",
-        mime="text/csv",
+    q = f"""
+    WITH base AS (
+      SELECT
+        {ts_expr} AS ingestion_ts,
+        {site_expr} AS station_key,
+        {line_expr} AS line_key,
+        {delay_expr} AS delay_mins,
+        {dev_expr} AS has_dev
+      FROM {raw_table}
     )
+    SELECT
+      COUNT(*) AS total_departures,
+      COUNT(DISTINCT station_key) AS active_stations,
+      COUNT(DISTINCT line_key) AS active_lines,
+      AVG(delay_mins) AS avg_delay,
+      MAX(delay_mins) AS max_delay,
+      SUM(CASE WHEN delay_mins > 5 THEN 1 ELSE 0 END) AS significant_delays,
+      SUM(CASE WHEN has_dev THEN 1 ELSE 0 END) AS active_disruptions,
+      MAX(ingestion_ts) AS last_update
+    FROM base
+    WHERE ingestion_ts IS NOT NULL
+      AND ingestion_ts >= current_timestamp - INTERVAL '15 minutes'
+    """
 
-st.divider()
+    try:
+        row = con.execute(q).fetchone()
+        if not row:
+            return {"__error__": "Live stats query returned no rows"}
 
-# --- SECTION 3: Forecast
-st.subheader("🧭 Mobility Forecast (Next Day)")
-st.caption("ML Readiness: High (baseline MA7 from mart_timeseries_daily)")
+        return {
+            "raw_table": raw_table,
+            "total_departures": int(row[0] or 0),
+            "active_stations": int(row[1] or 0),
+            "active_lines": int(row[2] or 0),
+            "avg_delay": float(row[3] or 0),
+            "max_delay": float(row[4] or 0),
+            "significant_delays": int(row[5] or 0),
+            "active_disruptions": int(row[6] or 0),
+            "last_update": row[7],
+        }
+    except Exception as e:
+        return {"__error__": f"{e}\n\nRaw table used: {raw_table}\nColumns: {sorted(list(cols))[:40]}..."}
 
-df_pred = build_next_day_prediction(selected_date, category)
-figp = fig_forecast(df_pred, category)
-if figp is not None:
-    st.plotly_chart(figp, use_container_width=True)
-else:
-    st.warning("No timeseries data available for prediction yet.")
 
-st.caption("Attribution: data provided by Trafiklab.se (CC-BY).")
+@st.cache_data(ttl=60)
+def get_hourly_trends(hours: int = 24) -> pd.DataFrame:
+    con = get_db_connection()
+    if not con or not table_exists(con, FACT_HOURLY):
+        return pd.DataFrame()
+
+    q = f"""
+    SELECT
+      hour,
+      total_departures,
+      avg_delay_minutes,
+      delayed_departures,
+      delay_percentage
+    FROM {FACT_HOURLY}
+    WHERE hour >= current_timestamp - INTERVAL '{hours} hours'
+    ORDER BY hour
+    """
+    return safe_df(con, q)
+
+
+@st.cache_data(ttl=120)
+def get_congestion_last_24h() -> pd.DataFrame:
+    con = get_db_connection()
+    if not con or not table_exists(con, FACT_CONGESTION):
+        return pd.DataFrame()
+
+    q = f"""
+    SELECT
+      hour,
+      station_name,
+      congestion_score,
+      congestion_level,
+      traffic_status,
+      avg_delay
+    FROM {FACT_CONGESTION}
+    WHERE hour >= current_timestamp - INTERVAL '24 hours'
+    ORDER BY hour
+    """
+    return safe_df(con, q)
+
+
+@st.cache_data(ttl=300)
+def get_predictions() -> pd.DataFrame:
+    """Get 7-day predictions"""
+    con = get_db_connection()
+
+    if con and PREDICTIONS_TABLE and table_exists(con, PREDICTIONS_TABLE):
+        df = safe_df(con, f"SELECT * FROM {PREDICTIONS_TABLE}")
+        if not df.empty:
+            return df
+
+    if PREDICTIONS_CSV_FALLBACK.exists():
+        try:
+            return pd.read_csv(PREDICTIONS_CSV_FALLBACK)
+        except Exception:
+            return pd.DataFrame()
+
+    return pd.DataFrame()
+
+
+# =============================================================================
+# Main UI
+# =============================================================================
+def main():
+    # Header
+    c1, c2, c3 = st.columns([2.2, 1, 1])
+    with c1:
+        st.title("🚇 Stockholm Traffic Analytics")
+        st.markdown("**Real-time monitoring with AI-powered 7-day predictions**")
+        #st.caption(f"DB: `{DUCKDB_DATABASE}`")
+
+    with c2:
+        auto_refresh = st.checkbox("🔄 Auto-refresh", value=True)
+        refresh_seconds = st.selectbox("Interval", [15, 30, 60, 120], index=1)
+
+    with c3:
+        if st.button("🔃 Refresh now"):
+            st.cache_data.clear()
+            st.rerun()
+
+    # Safe auto-refresh
+    if auto_refresh:
+        last = st.session_state.get("last_refresh_ts")
+        now = time.time()
+        if last is None or (now - last) >= refresh_seconds:
+            st.session_state["last_refresh_ts"] = now
+            st.cache_data.clear()
+            st.rerun()
+
+    con = get_db_connection()
+    if con is None:
+        st.error("⚠️ DuckDB not found or not accessible.")
+        st.stop()
+
+    # Live stats
+    stats = get_live_statistics()
+    if not stats or "__error__" in stats:
+        st.error("⚠️ Could not load live stats.")
+        if stats and "__error__" in stats:
+            st.code(stats["__error__"])
+        st.stop()
+
+    st.info(f"📡 Last data update: **{human_age(stats.get('last_update'))}**")
+    st.caption(f"Using raw table: `{stats.get('raw_table')}`")
+
+    st.divider()
+
+    # KPI
+    st.subheader("📊 Live Metrics (Last 15 minutes)")
+    k1, k2, k3, k4 = st.columns(4)
+
+    with k1:
+        st.metric("Total Departures", f"{stats['total_departures']:,}", f"{stats['active_stations']} stations")
+
+    with k2:
+        st.metric("Average Delay", f"{stats['avg_delay']:.1f} min", f"Max: {stats['max_delay']:.0f} min", delta_color="inverse")
+
+    with k3:
+        pct = (stats["significant_delays"] / max(stats["total_departures"], 1)) * 100
+        st.metric("Significant Delays", f"{stats['significant_delays']:,}", f"{pct:.1f}%", delta_color="inverse")
+
+    with k4:
+        st.metric("Active Lines", f"{stats['active_lines']:,}", f"{stats['active_disruptions']} deviations", delta_color="inverse")
+
+    st.divider()
+
+    tab1, tab2, tab3 = st.tabs(["📈 Trends", "📊 Congestion", "🔮 Predictions (Optional)"])
+
+    with tab1:
+        st.subheader("📈 Hourly trends (marts)")
+        hours = st.slider("Hours back", min_value=6, max_value=72, value=24, step=6)
+        hourly_df = get_hourly_trends(hours)
+
+        if hourly_df.empty:
+            st.warning("No hourly mart data found. Ensure dbt built `analytics_analytics_marts.fact_hourly_delays`.")
+        else:
+            fig1 = go.Figure()
+            fig1.add_trace(go.Scatter(x=hourly_df["hour"], y=hourly_df["total_departures"], mode="lines+markers", name="Departures", fill="tozeroy"))
+            fig1.update_layout(title=f"Departures per Hour (Last {hours}h)", xaxis_title="Hour", yaxis_title="Departures", height=380)
+            st.plotly_chart(fig1, use_container_width=True)
+
+            left, right = st.columns(2)
+            with left:
+                fig2 = go.Figure()
+                fig2.add_trace(go.Scatter(x=hourly_df["hour"], y=hourly_df["avg_delay_minutes"], mode="lines+markers", name="Avg delay (min)"))
+                fig2.update_layout(title="Average Delay", xaxis_title="Hour", yaxis_title="Minutes", height=330)
+                st.plotly_chart(fig2, use_container_width=True)
+
+            with right:
+                fig3 = go.Figure()
+                fig3.add_trace(go.Bar(x=hourly_df["hour"], y=hourly_df["delay_percentage"], name="Delay %"))
+                fig3.update_layout(title="Delay Percentage", xaxis_title="Hour", yaxis_title="Percent", height=330)
+                st.plotly_chart(fig3, use_container_width=True)
+
+    with tab2:
+        st.subheader("📊 Congestion (last 24h)")
+        cong_df = get_congestion_last_24h()
+
+        if cong_df.empty:
+            st.warning("No congestion mart data found. Ensure dbt built `analytics_analytics_marts.fact_congestion_score`.")
+        else:
+            latest = cong_df.sort_values("hour").groupby("station_name")["congestion_score"].last().sort_values(ascending=False)
+
+            fig = px.bar(x=latest.values, y=latest.index, orientation="h", title="Current Congestion Score by Station", labels={"x": "Congestion Score", "y": "Station"})
+            fig.update_layout(height=520)
+            st.plotly_chart(fig, use_container_width=True)
+
+            fig2 = px.line(cong_df, x="hour", y="congestion_score", color="station_name", title="Congestion Timeline (24h)")
+            fig2.update_layout(height=420)
+            st.plotly_chart(fig2, use_container_width=True)
+
+    with tab3:
+        st.subheader("🔮 Predictions (Optional ML)")
+
+        with st.expander("🤖 Model status", expanded=True):
+            if MODEL_PATH.exists():
+                mt = datetime.fromtimestamp(MODEL_PATH.stat().st_mtime)
+                age = datetime.now() - mt
+                st.success(f"✅ Model found: trained {age.days} day(s) ago")
+                st.caption(f"Last modified: {mt.strftime('%Y-%m-%d %H:%M:%S')}")
+            else:
+                st.warning("⚠️ No model file found yet.")
+                st.caption(f"Expected: {MODEL_PATH}")
+
+        pred_df = get_predictions()
+        if pred_df.empty:
+            st.warning("No predictions available. Set `PREDICTIONS_TABLE` or ensure `predictions_sample.csv` exists.")
+        else:
+            st.success(f"✅ Loaded predictions: {len(pred_df):,} rows")
+            st.dataframe(pred_df.head(200), use_container_width=True)
+
+    with st.sidebar:
+        st.header("⚙️ Info")
+        st.caption(f"Repo root: {REPO_ROOT}")
+        st.divider()
+
+        st.markdown("**DuckDB**")
+        st.code(DUCKDB_DATABASE, language="text")
+
+        st.markdown("**Schemas**")
+        st.markdown(f"- Raw: `{RAW_SCHEMA}`")
+        st.markdown(f"- Marts: `{MART_SCHEMA}`")
+
+        st.divider()
+        st.markdown("**Monitored sites**")
+        for k, v in STOCKHOLM_STATIONS.items():
+            st.markdown(f"- {k}: {v}")
+
+
+if __name__ == "__main__":
+    main()
