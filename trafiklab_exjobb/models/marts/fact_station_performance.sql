@@ -43,4 +43,4 @@ select
 
 from {{ ref('stg_departures') }}
 where expected_datetime >= current_timestamp - interval '30 days'
-group by station_id, station_name;
+group by station_id, station_name

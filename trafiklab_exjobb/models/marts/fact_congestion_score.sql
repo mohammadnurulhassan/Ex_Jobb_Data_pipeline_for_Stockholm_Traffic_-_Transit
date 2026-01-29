@@ -75,6 +75,6 @@ select
 
     current_timestamp as created_at
 
-from hourly_metrics;
+from hourly_metrics
 
 

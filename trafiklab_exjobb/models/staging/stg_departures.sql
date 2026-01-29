@@ -42,6 +42,15 @@ with src as (
 features as (
     select
         *,
+           md5(
+          cast(station_id as varchar) || '|' ||
+          coalesce(line_designation, '') || '|' ||
+          coalesce(destination, '') || '|' ||
+          cast(expected_datetime as varchar) || '|' ||
+          cast(scheduled_datetime as varchar)
+        ) as departure_id,
+
+
         -- compute delay in minutes (expected - scheduled)
         -- NOTE: positive = delayed, negative = early
         date_diff('minute', scheduled_datetime, expected_datetime) as delay_minutes,
@@ -61,6 +70,6 @@ features as (
       and scheduled_datetime is not null
 )
 
-select * from features;
+select * from features
 
 

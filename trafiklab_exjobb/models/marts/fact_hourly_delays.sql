@@ -30,7 +30,7 @@ select
 
 from {{ ref('stg_departures') }}
 where expected_datetime >= current_timestamp - interval '90 days'
-group by 1,2,3,4,5;
+group by 1,2,3,4,5
 
 
 
