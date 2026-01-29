@@ -586,9 +586,67 @@ def main():
     #st.write("")
 
     # Tabs (React-like)
+    #home_tab, live_tab, forecast_tab, congestion_tab, stations_tab = st.tabs(
+        #["🏠 Home", "🔴 Live", "🔮 Forecast", "📊 Congestion", "🚉 Stations"]
+    #)
+
+    # --- CSS (put once) ---
+    st.markdown("""
+        <style>
+    .r5-card{
+     background: linear-gradient(180deg, rgba(30,41,59,0.85), rgba(15,23,42,0.85));
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 18px;
+     padding: 16px 16px 6px 16px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+    }
+
+    /* Optional: make the tabs bar white INSIDE the card */
+    div[data-testid="stTabs"] > div{
+    background: #ffffff !important;
+    border-radius: 14px !important;
+     padding: 10px 10px 0 10px !important;
+    border: 1px solid rgba(0,0,0,0.08) !important;
+    }
+    div[data-testid="stTabs"] button[role="tab"] p{
+    color: rgba(0,0,0,0.78) !important;
+    font-weight: 600 !important;
+    }
+    div[data-testid="stTabs"] button[aria-selected="true"] p{
+    color: rgba(0,0,0,0.95) !important;
+    }
+    div[data-testid="stTabs"] div[data-baseweb="tab-border"]{
+    display: none !important;
+    }
+    </style>
+    """, 
+    unsafe_allow_html=True)
+
+    # --- OPEN the big card BEFORE tabs ---
+    #st.markdown('<div class="r5-card">', unsafe_allow_html=True)
+
+    # Tabs (React-like)
     home_tab, live_tab, forecast_tab, congestion_tab, stations_tab = st.tabs(
-        ["🏠 Home", "🔴 Live", "🔮 Forecast", "📊 Congestion", "🚉 Stations"]
+    ["🏠 Home", "🔴 Live", "🔮 Forecast", "📊 Congestion", "🚉 Stations"]
     )
+
+    with home_tab:
+        st.write("Home content here...")
+    # your charts, KPIs, etc.
+
+    with live_tab:
+        st.write("Live content here...")
+
+    with forecast_tab:
+        st.write("Forecast content here...")
+
+    with congestion_tab:
+        st.write("Congestion content here...")
+    with stations_tab:
+        st.write("Stations content here...")
+
+    # --- CLOSE the big card AFTER tabs content ---
+    st.markdown("</div>", unsafe_allow_html=True)
 
     # HOME
     with home_tab:
@@ -728,7 +786,7 @@ def main():
 
     # LIVE
     with live_tab:
-        st.markdown('<div class="r5-card">', unsafe_allow_html=True)
+        #st.markdown('<div class="r5-card">', unsafe_allow_html=True)
         st.markdown("## 🔴 Live Stream")
 
         hourly_df = get_hourly_trends(24)
@@ -756,7 +814,7 @@ def main():
 
     # FORECAST
     with forecast_tab:
-        st.markdown('<div class="r5-card">', unsafe_allow_html=True)
+        #st.markdown('<div class="r5-card">', unsafe_allow_html=True)
         st.markdown("## 🔮 7-Day Forecast (Optional ML)")
 
         with st.expander("🤖 Model status", expanded=True):
@@ -780,7 +838,7 @@ def main():
 
     # CONGESTION
     with congestion_tab:
-        st.markdown('<div class="r5-card">', unsafe_allow_html=True)
+        #st.markdown('<div class="r5-card">', unsafe_allow_html=True)
         st.markdown("## 📊 Congestion (last 24h)")
 
         cong_df = get_congestion_last_24h()
@@ -810,7 +868,7 @@ def main():
 
     # STATIONS
     with stations_tab:
-        st.markdown('<div class="r5-card">', unsafe_allow_html=True)
+        #st.markdown('<div class="r5-card">', unsafe_allow_html=True)
         st.markdown("## 🚉 Stations")
 
         # If you have FACT_STATION later, replace this section.

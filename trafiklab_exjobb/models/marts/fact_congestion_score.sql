@@ -1,48 +1,37 @@
--- Calculated congestion scores
-{{ config(
-    materialized='table',
-    schema='analytics_marts'
-) }}
+{{ config(materialized='table', schema='analytics_marts') }}
 
-WITH hourly_metrics AS (
-    SELECT
-        date_trunc('hour', expected_datetime) AS hour,
+with hourly_metrics as (
+    select
+        date_trunc('hour', expected_datetime) as hour,
         station_id,
         station_name,
 
-        -- Traffic volume
-        count(*) AS departure_count,
-        count(distinct line_designation) AS active_lines,
+        count(*) as departure_count,
+        count(distinct line_designation) as active_lines,
 
-        -- Delay metrics
-        avg(delay_minutes) AS avg_delay,
-        stddev_samp(delay_minutes) AS delay_variance,
-        max(delay_minutes) AS max_delay,
+        avg(delay_minutes) as avg_delay,
+        stddev_samp(delay_minutes) as delay_variance,
+        max(delay_minutes) as max_delay,
 
-        -- Delayed vehicles
-        sum(case when is_delayed then 1 else 0 end) AS delayed_vehicles,
+        sum(case when is_delayed then 1 else 0 end) as delayed_vehicles,
 
-        -- By mode (DuckDB-safe)
-        sum(case when transport_mode = 'METRO' then 1 else 0 end) AS metro_count,
-        sum(case when transport_mode = 'BUS'   then 1 else 0 end) AS bus_count,
-        sum(case when transport_mode = 'TRAIN' then 1 else 0 end) AS train_count,
-        sum(case when transport_mode = 'TRAM'  then 1 else 0 end) AS tram_count,
+        sum(case when transport_mode = 'METRO' then 1 else 0 end) as metro_count,
+        sum(case when transport_mode = 'BUS'   then 1 else 0 end) as bus_count,
+        sum(case when transport_mode = 'TRAIN' then 1 else 0 end) as train_count,
+        sum(case when transport_mode = 'TRAM'  then 1 else 0 end) as tram_count,
 
-        -- Deviations
-        sum(case when has_deviation then 1 else 0 end) AS disruption_count,
+        sum(case when has_deviation then 1 else 0 end) as disruption_count,
 
-        -- Time flags
-        bool_or(is_morning_rush) AS is_morning_rush,
-        bool_or(is_evening_rush) AS is_evening_rush,
-        bool_or(is_weekend) AS is_weekend
+        bool_or(is_morning_rush) as is_morning_rush,
+        bool_or(is_evening_rush) as is_evening_rush,
+        bool_or(is_weekend) as is_weekend
 
-    FROM {{ ref('stg_departures') }}
-    WHERE expected_datetime >= current_timestamp - interval '60 days'
-      and delay_minutes is not null
-    GROUP BY 1, 2, 3
+    from {{ ref('stg_departures') }}
+    where expected_datetime >= current_timestamp - interval '60 days'
+    group by 1,2,3
 )
 
-SELECT
+select
     hour,
     station_id,
     station_name,
@@ -61,37 +50,31 @@ SELECT
     is_evening_rush,
     is_weekend,
 
-    -- Congestion Score Calculation (0-100)
     least(100, greatest(0,
-        (coalesce(avg_delay, 0) * 7.0) +                    -- Avg delay impact
-        (coalesce(delay_variance, 0) * 3.0) +               -- Variability impact
-        (case
-            when departure_count > 80 then 20               -- High volume
-            when departure_count > 50 then 10
-            else 0
-        end) +
-        (coalesce(delayed_vehicles, 0) * 1.5) +             -- Delayed count impact
-        (coalesce(disruption_count, 0) * 5.0) +             -- Disruption impact
-        (case when coalesce(max_delay, 0) > 15 then 10 else 0 end)  -- Major delay bonus
-    ))::integer AS congestion_score,
+        (coalesce(avg_delay, 0) * 7.0) +
+        (coalesce(delay_variance, 0) * 3.0) +
+        (case when departure_count > 80 then 20 when departure_count > 50 then 10 else 0 end) +
+        (coalesce(delayed_vehicles, 0) * 1.5) +
+        (coalesce(disruption_count, 0) * 5.0) +
+        (case when coalesce(max_delay, 0) > 15 then 10 else 0 end)
+    ))::integer as congestion_score,
 
-    -- Congestion Level Category
     case
         when least(100, (coalesce(avg_delay, 0) * 7.0) + (coalesce(delay_variance, 0) * 3.0)) < 25 then 'Low'
         when least(100, (coalesce(avg_delay, 0) * 7.0) + (coalesce(delay_variance, 0) * 3.0)) < 50 then 'Moderate'
         when least(100, (coalesce(avg_delay, 0) * 7.0) + (coalesce(delay_variance, 0) * 3.0)) < 75 then 'High'
         else 'Critical'
-    end AS congestion_level,
+    end as congestion_level,
 
-    -- Traffic Status
     case
         when coalesce(avg_delay, 0) < 2 and coalesce(delayed_vehicles, 0) < 3 then 'Smooth'
         when coalesce(avg_delay, 0) < 5 and coalesce(delayed_vehicles, 0) < 10 then 'Normal'
         when coalesce(avg_delay, 0) < 8 then 'Congested'
         else 'Heavy'
-    end AS traffic_status,
+    end as traffic_status,
 
-    current_timestamp AS created_at
+    current_timestamp as created_at
 
-FROM hourly_metrics
+from hourly_metrics;
+
 

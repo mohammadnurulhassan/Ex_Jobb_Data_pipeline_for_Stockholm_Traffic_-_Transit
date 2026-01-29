@@ -1,59 +1,46 @@
--- Station-level performance metrics
-{{ config(
-    materialized='table',
-    schema='analytics_marts'
-) }}
+{{ config(materialized='table', schema='analytics_marts') }}
 
-SELECT
+select
     station_id,
     station_name,
 
-    -- Overall metrics
-    count(*) AS total_departures,
-    count(distinct line_designation) AS unique_lines,
-    count(distinct transport_mode) AS transport_modes,
+    count(*) as total_departures,
+    count(distinct line_designation) as unique_lines,
+    count(distinct transport_mode) as transport_modes,
 
-    -- Delay statistics
-    avg(delay_minutes) AS avg_delay_minutes,
-    max(delay_minutes) AS max_delay_minutes,
-    quantile_cont(delay_minutes, 0.5) AS median_delay_minutes,
-    quantile_cont(delay_minutes, 0.95) AS p95_delay_minutes,
+    avg(delay_minutes) as avg_delay_minutes,
+    max(delay_minutes) as max_delay_minutes,
+    quantile_cont(delay_minutes, 0.5) as median_delay_minutes,
+    quantile_cont(delay_minutes, 0.95) as p95_delay_minutes,
 
-    -- Delay categories
-    sum(case when delay_minutes = 0 then 1 else 0 end) AS on_time_departures,
-    sum(case when delay_minutes between 1 and 3 then 1 else 0 end) AS minor_delays,
-    sum(case when delay_minutes between 4 and 10 then 1 else 0 end) AS moderate_delays,
-    sum(case when delay_minutes > 10 then 1 else 0 end) AS major_delays,
+    sum(case when delay_minutes <= 0 then 1 else 0 end) as on_time_or_early_departures,
+    sum(case when delay_minutes between 1 and 3 then 1 else 0 end) as minor_delays,
+    sum(case when delay_minutes between 4 and 10 then 1 else 0 end) as moderate_delays,
+    sum(case when delay_minutes > 10 then 1 else 0 end) as major_delays,
 
-    -- Percentages
-    round(100.0 * sum(case when is_delayed then 1 else 0 end) / count(*), 2) AS overall_delay_rate,
-    round(100.0 * sum(case when delay_minutes = 0 then 1 else 0 end) / count(*), 2) AS on_time_rate,
+    round(100.0 * sum(case when is_delayed then 1 else 0 end) / count(*), 2) as overall_delay_rate,
+    round(100.0 * sum(case when delay_minutes <= 0 then 1 else 0 end) / count(*), 2) as on_time_rate,
 
-    -- By transport mode
-    avg(case when transport_mode = 'METRO' then delay_minutes end) AS metro_avg_delay,
-    avg(case when transport_mode = 'BUS' then delay_minutes end) AS bus_avg_delay,
-    avg(case when transport_mode = 'TRAIN' then delay_minutes end) AS train_avg_delay,
+    avg(case when transport_mode = 'METRO' then delay_minutes end) as metro_avg_delay,
+    avg(case when transport_mode = 'BUS' then delay_minutes end) as bus_avg_delay,
+    avg(case when transport_mode = 'TRAIN' then delay_minutes end) as train_avg_delay,
+    avg(case when transport_mode = 'TRAM' then delay_minutes end) as tram_avg_delay,
 
-    -- Rush hour analysis
-    avg(case when is_morning_rush then delay_minutes end) AS morning_rush_avg_delay,
-    avg(case when is_evening_rush then delay_minutes end) AS evening_rush_avg_delay,
-    avg(case when not is_morning_rush and not is_evening_rush then delay_minutes end) AS off_peak_avg_delay,
+    avg(case when is_morning_rush then delay_minutes end) as morning_rush_avg_delay,
+    avg(case when is_evening_rush then delay_minutes end) as evening_rush_avg_delay,
+    avg(case when not is_morning_rush and not is_evening_rush then delay_minutes end) as off_peak_avg_delay,
 
-    -- Weekend vs weekday
-    avg(case when is_weekend then delay_minutes end) AS weekend_avg_delay,
-    avg(case when not is_weekend then delay_minutes end) AS weekday_avg_delay,
+    avg(case when is_weekend then delay_minutes end) as weekend_avg_delay,
+    avg(case when not is_weekend then delay_minutes end) as weekday_avg_delay,
 
-    -- Disruptions
-    sum(case when has_deviation then 1 else 0 end) AS total_deviations,
-    round(100.0 * sum(case when has_deviation then 1 else 0 end) / count(*), 2) AS deviation_rate,
+    sum(case when has_deviation then 1 else 0 end) as total_deviations,
+    round(100.0 * sum(case when has_deviation then 1 else 0 end) / count(*), 2) as deviation_rate,
 
-    -- Time range
-    min(expected_datetime) AS first_departure,
-    max(expected_datetime) AS last_departure,
+    min(expected_datetime) as first_departure,
+    max(expected_datetime) as last_departure,
 
-    current_timestamp AS created_at
+    current_timestamp as created_at
 
-FROM {{ ref('stg_departures') }}
-WHERE expected_datetime >= current_timestamp - interval '30 days'
-  and delay_minutes is not null
-GROUP BY station_id, station_name
+from {{ ref('stg_departures') }}
+where expected_datetime >= current_timestamp - interval '30 days'
+group by station_id, station_name;
