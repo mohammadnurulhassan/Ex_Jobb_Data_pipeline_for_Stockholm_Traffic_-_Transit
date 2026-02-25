@@ -5,8 +5,6 @@ DLT ingestion: SL Transport API (replaces SL Departures v4)
 - Keeps REALTIME_API_KEY in env
 """
 
-
-from __future__ import annotations
 from __future__ import annotations
 
 import sys
