@@ -42,3 +42,5 @@ dagster-duckdb>=0.21.0
 # Utilities
 # -----------------------------
 schedule>=1.2.0
+
+pyarrow>=14.0.0
