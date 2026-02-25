@@ -1,0 +1,15 @@
+
+stockholm_traffic:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: C:/Users/mdnrl/Documents/github/Ex_Jobb_Data_pipeline_for_Stockholm_Traffic_-_Transit/warehouse/stockholm_traffic.duckdb
+      schema: analytics
+      threads: 4
+
+    docker:  # Docker container
+      type: duckdb
+      path: "/app/warehouse/stockholm_traffic.duckdb"
+      schema: analytics
+      threads: 4

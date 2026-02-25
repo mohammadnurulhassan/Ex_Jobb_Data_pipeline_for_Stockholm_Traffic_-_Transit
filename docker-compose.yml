@@ -1,0 +1,39 @@
+
+
+services:
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    image: stockholm-dashboard:latest
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./warehouse:/app/warehouse
+      - ./ml_models/saved_models:/app/ml_models/saved_models
+    env_file:
+      - .env
+    depends_on:
+      - dagster
+    environment:
+      TZ: "Europe/Stockholm"
+      DBT_TARGET: "docker"
+    restart: unless-stopped
+
+  dagster:
+    build:
+      context: .
+      dockerfile: Dockerfile.dagster
+    image: stockholm-dagster:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./warehouse:/app/warehouse
+      - ./ml_models/saved_models:/app/ml_models/saved_models
+    env_file:
+      - .env
+    environment:
+      ENABLE_ML: "1"
+      DBT_TARGET: "docker"
+      TZ: "Europe/Stockholm"
+    restart: unless-stopped

@@ -16,7 +16,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy project files
 COPY . .
-
+# Copy dbt profiles so dbt can find them inside the container
+RUN mkdir -p /root/.dbt
+COPY trafiklab_exjobb/profiles.yml /root/.dbt/profiles.yml
 # Create directories (will be mounted from Azure)
 RUN mkdir -p /app/warehouse
 RUN mkdir -p /app/ml_models/saved_models

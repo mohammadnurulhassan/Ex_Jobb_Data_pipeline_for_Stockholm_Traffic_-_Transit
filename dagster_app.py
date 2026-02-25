@@ -377,63 +377,42 @@ _ml_sensors:   list = []
 
 if ENABLE_ML and ML_AVAILABLE:
 
-    # ── Asset 1: Train model ──────────────────────────────────────────────────
     @asset(
         group_name="ml",
         deps=[congestion_analytics],
-        description=(
-            "Train the congestion prediction model and save model_metrics.json. "
-            "Triggered daily at 02:00 and by the data-volume sensor."
-        ),
+        description="Train the congestion prediction model (runs weekly).",
     )
     def ml_model_training(context) -> Output[dict]:
         context.log.info("🤖 Training ML model…")
         _predictor, metrics, model_path = train_and_save_model()
         context.log.info(
-            f"✅ Model trained — MAE={metrics.get('test_mae')}, "
-            f"R²={metrics.get('test_r2')}, accuracy={metrics.get('accuracy_pct')}%"
+            f"✅ Model trained — MAE={metrics.get('test_mae')}, R²={metrics.get('test_r2')}, "
+            f"path={model_path}"
         )
         return Output(
             value=metrics,
             metadata={
-                "test_mae":           MetadataValue.float(float(metrics.get("test_mae",     0.0))),
-                "test_r2":            MetadataValue.float(float(metrics.get("test_r2",      0.0))),
-                "cv_mae":             MetadataValue.float(float(metrics.get("cv_mae",       0.0))),
-                "accuracy_pct":       MetadataValue.float(float(metrics.get("accuracy_pct", 0.0))),
-                "n_features":         MetadataValue.int(  int(  metrics.get("n_features",   0))),
+                "test_mae":           MetadataValue.float(float(metrics.get("test_mae", 0.0))),
+                "test_r2":            MetadataValue.float(float(metrics.get("test_r2",  0.0))),
+                "cv_mae":             MetadataValue.float(float(metrics.get("cv_mae",   0.0))),
                 "training_timestamp": MetadataValue.text(datetime.now().isoformat()),
                 "model_path":         MetadataValue.path(str(model_path)),
             },
         )
 
-    # ── Asset 2: Generate 7-day forecast ─────────────────────────────────────
-    # deps=[congestion_analytics] (NOT ml_model_training) so this can also run
-    # every 5 min as part of the main pipeline using the EXISTING saved model.
-    # It only needs a trained pkl on disk — it does NOT retrain.
     @asset(
         group_name="ml",
-        deps=[congestion_analytics],
-        description=(
-            "Generate 7-day congestion forecast using the saved model. "
-            "Runs every 5 min with the main pipeline so forecasts are always fresh."
-        ),
+        deps=[ml_model_training],
+        description="Generate 7-day congestion forecast (runs daily).",
     )
     def congestion_predictions(context) -> Output[pd.DataFrame]:
-        model_pkl = PROJECT_ROOT / "ml_models" / "saved_models" / "congestion_predictor.pkl"
-        if not model_pkl.exists():
-            raise SkipReason(
-                "No trained model found. Run ml_model_training first or: "
-                "python ml_models/congestion_predictor.py train"
-            )
-
-        context.log.info("🔮 Generating 7-day forecast with saved model…")
+        context.log.info("🔮 Generating 7-day forecast…")
         predictions_df = generate_forecast()
 
-        avg_pred       = float(predictions_df["predicted_congestion"].mean())
-        max_pred       = float(predictions_df["predicted_congestion"].max())
+        avg_pred      = float(predictions_df["predicted_congestion"].mean())
+        max_pred      = float(predictions_df["predicted_congestion"].max())
         critical_hours = int((predictions_df["congestion_level"] == "Critical").sum())
 
-        # Also save a CSV fallback for the dashboard
         sample_csv = PROJECT_ROOT / "predictions_sample.csv"
         predictions_df.to_csv(sample_csv, index=False)
 
@@ -444,120 +423,83 @@ if ENABLE_ML and ML_AVAILABLE:
         return Output(
             value=predictions_df,
             metadata={
-                "total_predictions":        MetadataValue.int(len(predictions_df)),
-                "avg_predicted_congestion": MetadataValue.float(avg_pred),
-                "max_predicted_congestion": MetadataValue.float(max_pred),
-                "critical_hours_predicted": MetadataValue.int(critical_hours),
-                "prediction_timestamp":     MetadataValue.text(datetime.now().isoformat()),
-                "sample_predictions":       MetadataValue.path(str(sample_csv)),
+                "total_predictions":         MetadataValue.int(len(predictions_df)),
+                "avg_predicted_congestion":  MetadataValue.float(avg_pred),
+                "max_predicted_congestion":  MetadataValue.float(max_pred),
+                "critical_hours_predicted":  MetadataValue.int(critical_hours),
+                "prediction_timestamp":      MetadataValue.text(datetime.now().isoformat()),
+                "sample_predictions":        MetadataValue.path(str(sample_csv)),
             },
         )
 
     _ml_assets.extend([ml_model_training, congestion_predictions])
 
-    # ── Jobs ──────────────────────────────────────────────────────────────────
     model_training_job = define_asset_job(
         name="model_training",
-        selection=AssetSelection.assets(ml_model_training),
-        description="Retrain ML model (triggered daily or by data-volume sensor).",
+        selection=AssetSelection.assets(ml_model_training).upstream(),
+        description="Retrain ML model (weekly).",
     )
-    _ml_jobs.append(model_training_job)
+    prediction_job = define_asset_job(
+        name="prediction_generation",
+        selection=AssetSelection.assets(congestion_predictions),
+        description="Generate 7-day forecast (daily).",
+    )
+    _ml_jobs.extend([model_training_job, prediction_job])
 
-    # ── Schedules ─────────────────────────────────────────────────────────────
-    _ml_schedules.append(
+    _ml_schedules.extend([
         ScheduleDefinition(
             job=model_training_job,
-            cron_schedule="0 2 * * *",        # Daily 02:00 (was weekly Sunday only)
-            name="daily_model_training",
-            description="Retrain ML model every day at 2 AM so it learns new data.",
-        )
-    )
-
-    # ── Sensors ───────────────────────────────────────────────────────────────
+            cron_schedule="0 2 * * 0",   # Sunday 02:00
+            name="weekly_model_training",
+            description="Retrain ML model every Sunday at 2 AM.",
+        ),
+        ScheduleDefinition(
+            job=prediction_job,
+            cron_schedule="0 1 * * *",   # Daily 01:00
+            name="daily_prediction_generation",
+            description="Generate 7-day forecast daily at 1 AM.",
+        ),
+    ])
 
     @sensor(
-        job=model_training_job,
-        name="data_volume_sensor",
-        minimum_interval_seconds=300,   # check every 5 min (matches ingestion cadence)
-        description=(
-            "Triggers model retraining whenever fact_congestion_score grows by "
-            "≥50 rows since the last training run. "
-            "This is the main mechanism that keeps the model up to date as "
-            "Dagster ingests new SL departure data every 5 minutes."
-        ),
+        job=prediction_job,
+        name="new_model_sensor",
+        description="Trigger forecast generation whenever the model file changes.",
     )
-    def data_volume_sensor(context: SensorEvaluationContext):
-        """
-        Watches the row count of fact_congestion_score.
-        When 50+ new rows have appeared since the last run, trigger retraining.
-        50 rows ≈ ~1 hour of new data across all stations — enough to be worth retraining.
-        """
-        table_candidates = [
-            f"{MART_SCHEMA}.fact_congestion_score",
-            "analytics_analytics_marts.fact_congestion_score",
-            "analytics_marts.fact_congestion_score",
-        ]
-
-        current_count = 0
-        conn = _con(read_only=True)
-        try:
-            for table in table_candidates:
-                try:
-                    current_count = int(_scalar(conn, f"SELECT COUNT(*) FROM {table}") or 0)
-                    if current_count > 0:
-                        break
-                except Exception:
-                    continue
-        finally:
-            conn.close()
-
-        if current_count == 0:
-            yield SkipReason("fact_congestion_score is empty — waiting for dbt to build it.")
+    def new_model_trained_sensor(context: SensorEvaluationContext):
+        model_path = PROJECT_ROOT / "ml_models" / "saved_models" / "congestion_predictor.pkl"
+        if not model_path.exists():
+            yield SkipReason("Model file not found yet.")
             return
 
-        # Read cursor (last known row count when we last triggered)
-        last_count = int(context.cursor or "0")
-        new_rows   = current_count - last_count
+        last_modified = datetime.fromtimestamp(model_path.stat().st_mtime)
+        cursor_dt = datetime.min
+        if context.cursor:
+            try:
+                cursor_dt = datetime.fromisoformat(context.cursor)
+            except Exception:
+                cursor_dt = datetime.min
 
-        context.log.info(
-            f"data_volume_sensor: current={current_count}, last={last_count}, new={new_rows}"
-        )
-
-        if new_rows >= 50:
-            context.update_cursor(str(current_count))
+        if last_modified > cursor_dt:
             yield RunRequest(
-                run_key=f"retrain_at_{current_count}",
+                run_key=f"model_updated_{last_modified.isoformat()}",
                 run_config={},
-                tags={"trigger": "data_volume_sensor", "new_rows": str(new_rows)},
             )
+            context.update_cursor(last_modified.isoformat())
         else:
-            yield SkipReason(
-                f"Only {new_rows} new rows since last train (need ≥50). "
-                f"Current total: {current_count:,}"
-            )
+            yield SkipReason("No new model file detected.")
 
-    _ml_sensors.append(data_volume_sensor)
+    _ml_sensors.append(new_model_trained_sensor)
 
 
 # =============================================================================
 # JOBS & SCHEDULES (base pipeline)
 # =============================================================================
 
-# When ENABLE_ML=1, include congestion_predictions in the main 5-min pipeline
-# so the dashboard always shows fresh forecasts without a separate schedule.
-_ml_prediction_asset = (
-    [congestion_predictions] if (ENABLE_ML and ML_AVAILABLE) else []   # type: ignore[name-defined]
-)
-
 ingestion_and_transformation_job = define_asset_job(
     name="ingestion_and_transformation",
-    selection=AssetSelection.groups("ingestion", "transformation", "analytics")
-              | (AssetSelection.assets(*_ml_prediction_asset) if _ml_prediction_asset else AssetSelection.assets()),
-    description=(
-        "Full pipeline every 5 min: DLT ingest → dbt build → congestion analytics"
-        + (" → refresh ML forecast" if _ml_prediction_asset else "")
-        + "."
-    ),
+    selection=AssetSelection.groups("ingestion", "transformation", "analytics"),
+    description="Full pipeline: DLT ingest → dbt build → congestion analytics (every 5 min).",
 )
 
 ingestion_schedule = ScheduleDefinition(
@@ -566,7 +508,6 @@ ingestion_schedule = ScheduleDefinition(
     name="ingestion_schedule",
     description="Run full pipeline every 5 minutes.",
 )
-
 
 # =============================================================================
 # RESOURCES & DEFINITIONS
