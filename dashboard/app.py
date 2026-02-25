@@ -2,6 +2,21 @@
 FILE: dashboard/app.py
 Stockholm Traffic Analytics Dashboard — Streamlit Application
 
+Changes applied on top of base:
+  1. _db_conn            — retry logic (5 attempts) so DuckDB lock never crashes dashboard
+  2. get_live_statistics — track window_used; handle __locked__ gracefully
+  3. get_live_business_insights
+                         — removed local `from config` import (was shadowing module-level)
+                         — Network Health uses = 0 / = 1 (DuckDB stores booleans as INT)
+                         — G+J: total delay-minutes today + worst hotspot zone
+  4. get_delay_distribution / get_delay_severity_summary — new fetchers for Analysis tab
+  5. hero_header         — removed Auto-Refresh and Update badges; LIVE + Last Update only
+  6. Top KPI row         — c3 = Disruption Rate, c4 = Worst Station Now
+  7. Average Delay card  — subtitle shows actual window_used (not "Last active window")
+  8. Live tab bottom     — 2 cards only: Network Health + Delay Trend
+  9. Heatmap colorbar    — thickness=6, len=0.8 (slim bar)
+ 10. Analysis tab        — Delay Distribution (Option C):
+                           stacked bar + scatter + P95 ranking + station deep-dive donut
 """
 
 from __future__ import annotations
@@ -58,8 +73,7 @@ header    { visibility: hidden; }
 
 /* ── hero ── */
 .r5-hero {
-  border-radius: 26px; padding: 26px;
-  color: white;
+  border-radius: 26px; padding: 26px; color: white;
   background: linear-gradient(90deg, #2563eb 0%, #4f46e5 40%, #7c3aed 100%);
   box-shadow: 0 18px 45px rgba(0,0,0,0.45);
   position: relative; overflow: hidden;
@@ -84,7 +98,7 @@ header    { visibility: hidden; }
   box-shadow: 0 14px 35px rgba(0,0,0,0.35);
 }
 
-/* ── KPI card — fixed height so all 4 align ── */
+/* ── KPI card ── */
 .r5-kpi-card {
   background: rgba(255,255,255,0.98); border-radius: 18px; padding: 16px;
   box-shadow: 0 14px 35px rgba(0,0,0,0.35);
@@ -147,10 +161,10 @@ div[data-baseweb="tab-border"] { display: none !important; }
   display: flex; flex-direction: column; gap: 4px;
   border-left: 5px solid #7c3aed;
 }
-.r5-ml-metric .r5-ml-label  { font-size: 11px; font-weight: 900; color: #6b7280;
-                               letter-spacing:.08em; text-transform:uppercase; }
-.r5-ml-metric .r5-ml-val    { font-size: 30px; font-weight: 950; color: #4f46e5; line-height:1; }
-.r5-ml-metric .r5-ml-sub    { font-size: 11px; font-weight: 700; color: #9ca3af; }
+.r5-ml-metric .r5-ml-label { font-size: 11px; font-weight: 900; color: #6b7280;
+                              letter-spacing:.08em; text-transform:uppercase; }
+.r5-ml-metric .r5-ml-val   { font-size: 30px; font-weight: 950; color: #4f46e5; line-height:1; }
+.r5-ml-metric .r5-ml-sub   { font-size: 11px; font-weight: 700; color: #9ca3af; }
 
 /* ── model status pill ── */
 .r5-model-status {
@@ -161,82 +175,55 @@ div[data-baseweb="tab-border"] { display: none !important; }
 .r5-model-ok   { background:#d1fae5; color:#065f46; border:1px solid #6ee7b7; }
 .r5-model-warn { background:#fef3c7; color:#92400e; border:1px solid #fcd34d; }
 .r5-model-none { background:#f3f4f6; color:#6b7280; border:1px solid #d1d5db; }
-
-/* ── congestion level colour pills ── */
-.r5-level-low      { background:#d1fae5; color:#065f46; }
-.r5-level-moderate { background:#fef3c7; color:#92400e; }
-.r5-level-high     { background:#fed7aa; color:#9a3412; }
-.r5-level-critical { background:#fee2e2; color:#991b1b; }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-# =============================================================================
-# Constants
-# =============================================================================
-PREDICTIONS_CSV_FALLBACK = REPO_ROOT / "predictions_sample.csv"
-MODEL_PATH               = REPO_ROOT / "ml_models" / "saved_models" / "congestion_predictor.pkl"
-RAW_SCHEMA               = DLT_DATASET_NAME
-
-
-
 
 def _fmt_local(ts) -> str:
-    """
-    Format the last-query timestamp as HH:MM:SS.
-    DuckDB's current_timestamp may return a tz-aware object; strip the tz so
-    strftime shows the local wall-clock time with no offset applied.
-    """
+    """Format timestamp as HH:MM:SS local wall-clock time."""
     if ts is None:
         return "—"
     try:
         dt = pd.to_datetime(ts).to_pydatetime()
         if dt.tzinfo is not None:
-            dt = dt.replace(tzinfo=None)   # already local — drop tz tag
+            dt = dt.replace(tzinfo=None)
         return dt.strftime("%H:%M:%S")
     except Exception:
         return "—"
 
 
 # =============================================================================
-# DuckDB helpers  — FIX 1: short-lived connections, always closed
+# DuckDB helpers
 # =============================================================================
 
 @contextlib.contextmanager
 def _db_conn(read_only: bool = True):
     """
-    Context-manager: open a fresh DuckDB connection with retry logic.
-
-    DuckDB only allows one writer at a time. When Dagster's pipeline is
-    writing (DLT ingest / dbt build), the dashboard gets an IOException.
-    Instead of immediately failing, we retry up to 5 times with short
-    sleep intervals — the write window is usually <2 seconds.
-
-    Usage:
-        with _db_conn() as con:
-            df = con.execute("SELECT ...").fetchdf()
+    Open a DuckDB connection with automatic retry.
+    DuckDB allows only one writer — when Dagster is writing, we wait and retry
+    up to 5 times (total wait ~5.4 s max) before showing a soft warning.
     """
     MAX_RETRIES = 5
-    DELAYS      = [0.3, 0.6, 1.0, 1.5, 2.0]   # seconds between retries
+    DELAYS      = [0.3, 0.6, 1.0, 1.5, 2.0]
 
-    con       = None
-    last_exc  = None
+    con      = None
+    last_exc = None
 
     for attempt, wait in enumerate(DELAYS[:MAX_RETRIES]):
         try:
             con = duckdb.connect(DUCKDB_DATABASE, read_only=read_only)
-            break                               # success — exit retry loop
+            break
         except duckdb.IOException as exc:
             last_exc = exc
             if attempt < MAX_RETRIES - 1:
-                time.sleep(wait)                # wait then retry
+                time.sleep(wait)
             else:
-                # All retries exhausted — show a soft warning, not a hard crash
                 st.warning(
                     f"⚠️ DuckDB locked after {MAX_RETRIES} retries "
-                    f"(pipeline is writing). Showing cached data. "
-                    f"Will retry on next refresh."
+                    "(pipeline is writing). Showing cached data. "
+                    "Will retry on next refresh."
                 )
         except Exception as exc:
             last_exc = exc
@@ -244,7 +231,7 @@ def _db_conn(read_only: bool = True):
             break
 
     try:
-        yield con       # con is None if all retries failed — callers handle None
+        yield con
     finally:
         if con is not None:
             try:
@@ -254,7 +241,7 @@ def _db_conn(read_only: bool = True):
 
 
 def safe_df(con, query: str, params: list | None = None) -> pd.DataFrame:
-    """Execute query safely; return empty DataFrame on any error."""
+    """Execute query; return empty DataFrame on any error."""
     if con is None:
         return pd.DataFrame()
     try:
@@ -264,7 +251,7 @@ def safe_df(con, query: str, params: list | None = None) -> pd.DataFrame:
 
 
 def safe_scalar(con, query: str, default=None):
-    """Execute scalar query safely; return default on any error."""
+    """Execute scalar query; return default on any error."""
     if con is None:
         return default
     try:
@@ -293,7 +280,6 @@ def _table_exists(con, full_name: str) -> bool:
 
 
 def _first_existing(con, candidates: list[str]) -> str:
-    """Return the first table name from the list that actually exists."""
     for t in candidates:
         if t and _table_exists(con, t):
             return t
@@ -302,7 +288,6 @@ def _first_existing(con, candidates: list[str]) -> str:
 
 @st.cache_data(ttl=300)
 def resolve_tables() -> dict[str, str]:
-    """Resolve actual dbt table names — cached 5 min."""
     with _db_conn() as con:
         if con is None:
             return {}
@@ -337,25 +322,10 @@ def resolve_tables() -> dict[str, str]:
 # =============================================================================
 
 def _build_stats_query(stg: str, where_clause: str) -> str:
-    """
-    Live-statistics SQL.
-
-    FIX 8 (CORRECTED): expected_datetime is stored as Stockholm local time (naive).
-    Use it directly — NO AT TIME ZONE cast.  The previous version cast it as UTC
-    and compared against UTC current_timestamp, which was wrong because the stored
-    values are local, not UTC.
-
-    FIX 3: COUNT(DISTINCT line WHERE has_deviation) — not SUM(has_deviation).
-    """
     return f"""
     WITH base AS (
-        SELECT
-            expected_datetime,                                                    -- already Stockholm local
-            station_id,
-            line_designation,
-            delay_minutes,
-            is_delayed,
-            has_deviation
+        SELECT expected_datetime, station_id, line_designation,
+               delay_minutes, is_delayed, has_deviation
         FROM {stg}
         {where_clause}
     )
@@ -367,9 +337,6 @@ def _build_stats_query(stg: str, where_clause: str) -> str:
         MAX(delay_minutes)                                                        AS max_delay,
         SUM(CASE WHEN delay_minutes > 5 THEN 1 ELSE 0 END)                       AS significant_delays,
         COUNT(DISTINCT CASE WHEN has_deviation THEN line_designation END)         AS disrupted_lines,
-        -- FIX 8 (REAL FIX): expected_datetime is a future scheduled departure time,
-        -- so MAX(expected_datetime) always shows ~1 h ahead of now.
-        -- Use current_timestamp instead — it records when this query actually ran.
         current_timestamp                                                         AS last_update,
         SUM(CASE WHEN is_delayed THEN 1 ELSE 0 END)                              AS delayed_count
     FROM base
@@ -379,9 +346,8 @@ def _build_stats_query(stg: str, where_clause: str) -> str:
 @st.cache_data(ttl=20)
 def get_live_statistics() -> dict:
     """
-    Top-level KPI stats with cascading time-window fallback.
-    Returns __locked__ key (not __error__) when DB is temporarily busy
-    so the dashboard shows the last cached result instead of stopping.
+    KPI stats with cascading time-window fallback.
+    Tracks which window was used so cards can display it clearly.
     """
     tbls = resolve_tables()
     stg  = tbls.get("STG_DEPARTURES", "")
@@ -391,24 +357,24 @@ def get_live_statistics() -> dict:
             "Run: dbt build --project-dir trafiklab_exjobb"
         )}
 
-    # FIX 8 (CORRECTED): expected_datetime is local Stockholm time — compare directly
-    # against current_timestamp (also local on the machine running this).
-    # No AT TIME ZONE cast needed or correct here.
     windows = [
-        "WHERE expected_datetime >= current_timestamp - INTERVAL '60 minutes'",
-        "WHERE expected_datetime >= current_timestamp - INTERVAL '180 minutes'",
-        "",   # no filter — full table as last resort
+        ("WHERE expected_datetime >= current_timestamp - INTERVAL '60 minutes'",  "last 60 min"),
+        ("WHERE expected_datetime >= current_timestamp - INTERVAL '180 minutes'", "last 3 hours"),
+        ("", "all available data"),
     ]
 
-    row = None
-    for where in windows:
+    row         = None
+    window_used = "last 60 min"
+
+    for where, label in windows:
         with _db_conn() as con:
             if con is None:
                 break
             try:
                 candidate = con.execute(_build_stats_query(stg, where)).fetchone()
                 if candidate and int(candidate[0] or 0) > 0:
-                    row = candidate
+                    row         = candidate
+                    window_used = label
                     break
             except Exception:
                 continue
@@ -419,111 +385,74 @@ def get_live_statistics() -> dict:
     total           = int(row[0] or 0)
     sig             = int(row[5] or 0)
     sig_pct         = (sig / max(total, 1)) * 100
-
     disrupted_lines = int(row[6] or 0)
     active_lines    = int(row[2] or 1)
-    # FIX 2: rate-based — both terms 0–100 so result is always 0–100
     disruption_rate = (disrupted_lines / max(active_lines, 1)) * 100
     congestion      = min(100.0, max(0.0, sig_pct * 0.7 + disruption_rate * 0.3))
     on_time         = max(0.0, min(100.0, 100.0 - (float(row[8] or 0) / max(total, 1)) * 100))
 
-    # ── Peak Load Index ────────────────────────────────────────────────────
-    # A single 0–100 score showing how hard the network is being pushed NOW.
-    # Formula:  delay_score   = min(avg_delay / 10 * 100, 100)  → 10 min delay = 100%
-    #           sig_score     = sig_pct                          → % trips delayed >5 min
-    #           disruption    = disruption_rate                  → % lines disrupted
-    # Weighted blend: 40% delay severity + 35% significant delays + 25% disruption
-    avg_delay_val  = float(row[3] or 0)
-    delay_score    = min(avg_delay_val / 10.0 * 100.0, 100.0)
-    peak_load      = round(
-        min(100.0, max(0.0,
-            delay_score    * 0.40 +
-            sig_pct        * 0.35 +
-            disruption_rate * 0.25
-        )), 1
-    )
-    peak_label = (
-        "Low"      if peak_load < 25 else
-        "Moderate" if peak_load < 50 else
-        "High"     if peak_load < 75 else
-        "Critical"
-    )
-    peak_color = (
-        "#16a34a" if peak_load < 25 else
-        "#eab308" if peak_load < 50 else
-        "#ea580c" if peak_load < 75 else
-        "#dc2626"
-    )
+    avg_delay_val = float(row[3] or 0)
+    delay_score   = min(avg_delay_val / 10.0 * 100.0, 100.0)
+    peak_load     = round(min(100.0, max(0.0,
+        delay_score     * 0.40 +
+        sig_pct         * 0.35 +
+        disruption_rate * 0.25
+    )), 1)
+    peak_label = ("Low" if peak_load < 25 else "Moderate" if peak_load < 50
+                  else "High" if peak_load < 75 else "Critical")
+    peak_color = ("#16a34a" if peak_load < 25 else "#eab308" if peak_load < 50
+                  else "#ea580c" if peak_load < 75 else "#dc2626")
 
     return {
-        "total_departures":  total,
-        "active_stations":   int(row[1] or 0),
-        "active_lines":      active_lines,
-        "avg_delay":         float(row[3] or 0),
-        "max_delay":         float(row[4] or 0),
+        "total_departures":   total,
+        "active_stations":    int(row[1] or 0),
+        "active_lines":       active_lines,
+        "avg_delay":          float(row[3] or 0),
+        "max_delay":          float(row[4] or 0),
         "significant_delays": sig,
-        "disrupted_lines":   disrupted_lines,
-        "disruption_rate":   disruption_rate,
-        "last_update":       row[7],
-        "congestion_level":  congestion,
-        "on_time_rate":      on_time,
-        "peak_load_index":   peak_load,
-        "peak_load_label":   peak_label,
-        "peak_load_color":   peak_color,
+        "disrupted_lines":    disrupted_lines,
+        "disruption_rate":    disruption_rate,
+        "last_update":        row[7],
+        "congestion_level":   congestion,
+        "on_time_rate":       on_time,
+        "peak_load_index":    peak_load,
+        "peak_load_label":    peak_label,
+        "peak_load_color":    peak_color,
+        "window_used":        window_used,
     }
 
 
 @st.cache_data(ttl=10)
 def get_live_stream_minutes(window_minutes: int = 30) -> pd.DataFrame:
-    """
-    Per-minute chart aggregation.
-    FIX 8: UTC-safe WHERE + UTC-normalised ts_min.
-    FIX 2: rate-based congestion in SQL.
-    FIX 3: distinct disrupted lines per minute.
-    """
     tbls = resolve_tables()
     stg  = tbls.get("STG_DEPARTURES", "")
     if not stg:
         return pd.DataFrame()
-
     q = f"""
     WITH base AS (
         SELECT
-            -- FIX 8 (CORRECTED): expected_datetime is local — truncate directly
-            date_trunc('minute', expected_datetime)                               AS ts_min,
-            line_designation,
-            delay_minutes,
-            is_delayed,
-            has_deviation
+            date_trunc('minute', expected_datetime) AS ts_min,
+            line_designation, delay_minutes, is_delayed, has_deviation
         FROM {stg}
-        -- FIX 8 (CORRECTED): plain local-time comparison — no AT TIME ZONE needed
         WHERE expected_datetime >= current_timestamp - INTERVAL '{int(window_minutes)} minutes'
     ),
     agg AS (
-        SELECT
-            ts_min,
+        SELECT ts_min,
             COUNT(*)                                                               AS departures,
             AVG(delay_minutes)                                                     AS avg_delay,
             SUM(CASE WHEN delay_minutes > 5 THEN 1 ELSE 0 END)                    AS sig_delays,
-            -- FIX 3: distinct lines with deviation
             COUNT(DISTINCT CASE WHEN has_deviation THEN line_designation END)      AS disrupted_lines,
             COUNT(DISTINCT line_designation)                                       AS total_lines,
             SUM(CASE WHEN is_delayed THEN 1 ELSE 0 END)                           AS delayed
-        FROM base
-        GROUP BY 1
+        FROM base GROUP BY 1
     )
-    SELECT
-        ts_min,
-        departures,
-        avg_delay,
-        -- FIX 2: both components 0–100 → result always 0–100
+    SELECT ts_min, departures, avg_delay,
         LEAST(100.0, GREATEST(0.0,
             (100.0 * sig_delays      / GREATEST(departures,  1)) * 0.7 +
             (100.0 * disrupted_lines / GREATEST(total_lines, 1)) * 0.3
-        ))                                                                         AS congestion_pct,
-        (100.0 - (100.0 * delayed / GREATEST(departures, 1)))                     AS on_time_rate
-    FROM agg
-    ORDER BY ts_min
+        )) AS congestion_pct,
+        (100.0 - (100.0 * delayed / GREATEST(departures, 1))) AS on_time_rate
+    FROM agg ORDER BY ts_min
     """
     with _db_conn() as con:
         return safe_df(con, q)
@@ -532,17 +461,9 @@ def get_live_stream_minutes(window_minutes: int = 30) -> pd.DataFrame:
 @st.cache_data(ttl=20)
 def get_live_business_insights() -> dict:
     """
-    4 genuinely NEW business insights for the Live tab bottom row.
-    None of these are visible in the chart above — each answers a distinct
-    operational question a transport manager would actually act on.
-
-      1. worst_station      — which station has the highest avg delay right now
-      2. total_delay_mins   — cumulative passenger-minutes lost since midnight (G)
-                              + worst geographic hotspot zone (J)
-      3. network_health     — composite 0-100 score: on-time rate + station
-                              coverage + deviation-free lines (Option E)
-      4. delay_trend        — direction of avg delay: improving / worsening /
-                              stable, comparing last 5 min vs previous 5 min
+    Operational insights for Live tab bottom cards.
+    All boolean columns use = 0 / = 1 (DuckDB stores as INTEGER, not BOOL).
+    No local imports — uses module-level STOCKHOLM_STATIONS.
     """
     tbls = resolve_tables()
     stg  = tbls.get("STG_DEPARTURES", "")
@@ -554,32 +475,26 @@ def get_live_business_insights() -> dict:
         if con is None:
             return {}
 
-        # ── 1. Worst station right now (last 30 min) ──────────────────────
+        # 1. Worst station — last 30 min ───────────────────────────────────
         worst = safe_df(con, f"""
-            SELECT station_id,
-                   AVG(delay_minutes) AS avg_delay,
-                   COUNT(*)           AS trips
+            SELECT station_id, AVG(delay_minutes) AS avg_delay, COUNT(*) AS trips
             FROM {stg}
             WHERE expected_datetime >= current_timestamp - INTERVAL '30 minutes'
-            GROUP BY station_id
-            HAVING COUNT(*) >= 3
-            ORDER BY avg_delay DESC
-            LIMIT 1
+            GROUP BY station_id HAVING COUNT(*) >= 3
+            ORDER BY avg_delay DESC LIMIT 1
         """)
         if not worst.empty:
             sid = int(worst.iloc[0]["station_id"])
-            from config import STOCKHOLM_STATIONS
             result["worst_station_name"]  = STOCKHOLM_STATIONS.get(sid, f"Station {sid}")
             result["worst_station_delay"] = round(float(worst.iloc[0]["avg_delay"]), 1)
         else:
             result["worst_station_name"]  = "—"
             result["worst_station_delay"] = 0.0
 
-       
+        # 2. G+J: total delay-minutes today + worst hotspot zone ──────────
         delay_gj = safe_df(con, f"""
             WITH today_delays AS (
-                SELECT
-                    SUM(GREATEST(delay_minutes, 0))          AS total_delay_mins
+                SELECT SUM(GREATEST(delay_minutes, 0)) AS total_delay_mins
                 FROM {stg}
                 WHERE expected_datetime >= date_trunc('day', current_timestamp)
                   AND delay_minutes > 0
@@ -587,30 +502,20 @@ def get_live_business_insights() -> dict:
             zone_delays AS (
                 SELECT
                     CASE station_id
-                        WHEN 9001 THEN 'T-Centralen'
-                        WHEN 9192 THEN 'Slussen'
-                        WHEN 9191 THEN 'Medborgarplatsen'
-                        WHEN 9190 THEN 'Gamla Stan'
-                        WHEN 9204 THEN 'Odenplan'
-                        WHEN 9302 THEN 'Fridhemsplan'
-                        WHEN 9303 THEN 'Kungsträdgården'
-                        WHEN 1080 THEN 'Gullmarsplan'
-                        WHEN 1051 THEN 'Hötorget'
-                        WHEN 9506 THEN 'Södermalm'
+                        WHEN 9001 THEN 'T-Centralen'   WHEN 9192 THEN 'Slussen'
+                        WHEN 9191 THEN 'Medborgarplat' WHEN 9190 THEN 'Gamla Stan'
+                        WHEN 9204 THEN 'Odenplan'      WHEN 9302 THEN 'Fridhemsplan'
+                        WHEN 9303 THEN 'Kungsträd.'    WHEN 1080 THEN 'Gullmarsplan'
+                        WHEN 1051 THEN 'Hötorget'      WHEN 9506 THEN 'Södermalm'
                         ELSE 'Other'
-                    END                                       AS zone,
-                    AVG(delay_minutes)                        AS zone_avg_delay
+                    END AS zone,
+                    AVG(delay_minutes) AS zone_avg_delay
                 FROM {stg}
                 WHERE expected_datetime >= current_timestamp - INTERVAL '30 minutes'
-                GROUP BY 1
-                HAVING COUNT(*) >= 3
-                ORDER BY zone_avg_delay DESC
-                LIMIT 1
+                GROUP BY 1 HAVING COUNT(*) >= 3
+                ORDER BY zone_avg_delay DESC LIMIT 1
             )
-            SELECT
-                t.total_delay_mins,
-                z.zone           AS hotspot_zone,
-                z.zone_avg_delay AS hotspot_delay
+            SELECT t.total_delay_mins, z.zone AS hotspot_zone, z.zone_avg_delay AS hotspot_delay
             FROM today_delays t, zone_delays z
         """)
         if not delay_gj.empty:
@@ -623,81 +528,59 @@ def get_live_business_insights() -> dict:
             result["hotspot_zone"]     = "—"
             result["hotspot_delay"]    = 0.0
 
-        # ── 3. Network Health Score (Option E) ───────────────────────────
-        # Composite 0–100 score combining:
-        #   • on-time rate      (40%) — are departures running on schedule?
-        #   • station coverage  (35%) — how many stations actively reporting?
-        #   • deviation-free    (25%) — what % of lines have NO disruption?
-        #
-        # NOTE: is_delayed and has_deviation are stored as INTEGER (0/1) in
-        # DuckDB, NOT as native booleans — use = 0 / = 1 not = FALSE / = TRUE.
+        # 3. Network Health Score — 40% on-time + 35% coverage + 25% deviation-free
+        #    Uses = 0 / = 1 because DuckDB stores booleans as INTEGER
         health = safe_df(con, f"""
-            WITH window AS (
-                SELECT *
-                FROM {stg}
+            WITH w AS (
+                SELECT * FROM {stg}
                 WHERE expected_datetime >= current_timestamp - INTERVAL '30 minutes'
             ),
-            metrics AS (
+            m AS (
                 SELECT
-                    -- on-time rate 0-100
-                    100.0 * SUM(CASE WHEN is_delayed = 0 THEN 1 ELSE 0 END)
-                        / GREATEST(COUNT(*), 1)                              AS on_time_rate,
-                    -- station coverage: distinct stations reporting vs 10 expected
+                    100.0 * SUM(CASE WHEN is_delayed   = 0 THEN 1 ELSE 0 END)
+                          / GREATEST(COUNT(*), 1)                            AS on_time_rate,
                     100.0 * COUNT(DISTINCT station_id) / 10.0                AS station_coverage,
-                    -- deviation-free: lines where NO trip has a deviation
                     100.0 * COUNT(DISTINCT CASE WHEN has_deviation = 0
                                   THEN line_designation END)
-                        / GREATEST(COUNT(DISTINCT line_designation), 1)      AS deviation_free_rate,
+                          / GREATEST(COUNT(DISTINCT line_designation), 1)    AS deviation_free_rate,
                     COUNT(DISTINCT station_id)                               AS reporting_stations,
                     COUNT(DISTINCT line_designation)                         AS total_lines,
                     COUNT(*)                                                  AS total_rows
-                FROM window
+                FROM w
             )
-            SELECT
-                on_time_rate,
-                station_coverage,
-                deviation_free_rate,
-                reporting_stations,
-                total_lines,
-                total_rows,
-                ROUND(
-                    LEAST(100.0, GREATEST(0.0,
-                        on_time_rate        * 0.40 +
-                        station_coverage    * 0.35 +
-                        deviation_free_rate * 0.25
-                    )), 1
-                ) AS health_score
-            FROM metrics
+            SELECT on_time_rate, station_coverage, deviation_free_rate,
+                   reporting_stations, total_lines, total_rows,
+                   ROUND(LEAST(100.0, GREATEST(0.0,
+                       on_time_rate        * 0.40 +
+                       station_coverage    * 0.35 +
+                       deviation_free_rate * 0.25
+                   )), 1) AS health_score
+            FROM m
         """)
-
         if not health.empty and int(health.iloc[0].get("total_rows", 0) or 0) > 0:
             h = health.iloc[0]
-            result["network_health_score"] = round(float(h["health_score"]       or 0), 1)
-            result["network_reporting"]    = int(  h["reporting_stations"]        or 0)
-            result["network_total_lines"]  = int(  h["total_lines"]               or 0)
-            result["network_on_time"]      = round(float(h["on_time_rate"]        or 0), 1)
+            result["network_health_score"] = round(float(h["health_score"]    or 0), 1)
+            result["network_reporting"]    = int(  h["reporting_stations"]    or 0)
+            result["network_total_lines"]  = int(  h["total_lines"]           or 0)
+            result["network_on_time"]      = round(float(h["on_time_rate"]    or 0), 1)
         else:
-            # Fallback: reuse on_time_rate from get_live_statistics which
-            # already works (same table, same window) — avoids showing 0%.
-            from_stats = get_live_statistics()
-            ot  = float(from_stats.get("on_time_rate", 0))
-            dis = float(from_stats.get("disruption_rate", 0))
-            # simplified health: 70% on-time + 30% disruption-free
-            fallback_health = round(ot * 0.70 + max(0, 100 - dis) * 0.30, 1)
-            result["network_health_score"] = fallback_health
-            result["network_reporting"]    = int(from_stats.get("active_stations", 0))
-            result["network_total_lines"]  = int(from_stats.get("active_lines", 0))
+            # Fallback from get_live_statistics (same table, already working)
+            fs  = get_live_statistics()
+            ot  = float(fs.get("on_time_rate", 0))
+            dis = float(fs.get("disruption_rate", 0))
+            result["network_health_score"] = round(ot * 0.70 + max(0, 100 - dis) * 0.30, 1)
+            result["network_reporting"]    = int(fs.get("active_stations", 0))
+            result["network_total_lines"]  = int(fs.get("active_lines", 0))
             result["network_on_time"]      = round(ot, 1)
 
-
-        # ── 4. Delay trend: last 5 min vs previous 5 min ─────────────────
+        # 4. Delay trend: last 5 min vs previous 5 min ────────────────────
         trend = safe_df(con, f"""
             SELECT
                 AVG(CASE WHEN expected_datetime >= current_timestamp - INTERVAL '5 minutes'
-                         THEN delay_minutes END)  AS recent_delay,
+                         THEN delay_minutes END) AS recent_delay,
                 AVG(CASE WHEN expected_datetime <  current_timestamp - INTERVAL '5 minutes'
                           AND expected_datetime >= current_timestamp - INTERVAL '10 minutes'
-                         THEN delay_minutes END)  AS prior_delay
+                         THEN delay_minutes END) AS prior_delay
             FROM {stg}
             WHERE expected_datetime >= current_timestamp - INTERVAL '10 minutes'
         """)
@@ -729,14 +612,13 @@ def get_station_performance(limit: int = 10) -> pd.DataFrame:
     fact = tbls.get("FACT_STATION", "")
     if not fact:
         return pd.DataFrame()
-    q = f"""
-    SELECT station_name, total_departures, avg_delay_minutes, on_time_rate
-    FROM   {fact}
-    ORDER  BY total_departures DESC NULLS LAST
-    LIMIT  {int(limit)}
-    """
     with _db_conn() as con:
-        return safe_df(con, q)
+        return safe_df(con, f"""
+            SELECT station_name, total_departures, avg_delay_minutes, on_time_rate
+            FROM {fact}
+            ORDER BY total_departures DESC NULLS LAST
+            LIMIT {int(limit)}
+        """)
 
 
 @st.cache_data(ttl=300)
@@ -756,15 +638,8 @@ def get_predictions() -> pd.DataFrame:
     return pd.DataFrame()
 
 
-# ── [ML] New fetchers ──────────────────────────────────────────────────────────
-
 @st.cache_data(ttl=120)
 def get_ml_metrics() -> dict:
-    """
-    [ML] Read model_metrics.json written by congestion_predictor.save_model().
-    No sklearn / joblib dependency — pure JSON read.
-    Returns empty dict when the model has never been trained.
-    """
     json_path = MODEL_PATH.parent / "model_metrics.json"
     if not json_path.exists():
         return {}
@@ -778,44 +653,89 @@ def get_ml_metrics() -> dict:
 
 @st.cache_data(ttl=300)
 def get_feature_importance() -> pd.DataFrame:
-    """[ML] Read feature_importance.csv saved by the training pipeline."""
     csv_path = MODEL_PATH.parent / "feature_importance.csv"
     if not csv_path.exists():
         return pd.DataFrame()
     try:
-        df = pd.read_csv(csv_path)
-        return df.head(20)   # top-20 is enough for the chart
+        return pd.read_csv(csv_path).head(20)
     except Exception:
         return pd.DataFrame()
 
 
 @st.cache_data(ttl=120)
 def get_predictions_detail(station_filter: str = "All Stations") -> pd.DataFrame:
-    """
-    [ML] Load full predictions from DuckDB (or CSV fallback).
-    Applies optional station filter and adds helper columns for charting.
-    """
     df = get_predictions()
     if df.empty:
         return df
-
-    # Normalise column names
     df.columns = [c.lower() for c in df.columns]
-
-    # Parse timestamp
     for col in ("timestamp", "date"):
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
-
     if station_filter != "All Stations" and "station_name" in df.columns:
         df = df[df["station_name"] == station_filter]
-
-    # Add day_name if missing
     if "day_name" not in df.columns and "day_of_week" in df.columns:
         day_map = {0:"Mon", 1:"Tue", 2:"Wed", 3:"Thu", 4:"Fri", 5:"Sat", 6:"Sun"}
         df["day_name"] = df["day_of_week"].map(day_map)
-
     return df.sort_values("timestamp") if "timestamp" in df.columns else df
+
+
+# ── Delay Distribution fetchers (Analysis tab — Option C) ──────────────────
+
+@st.cache_data(ttl=120)
+def get_delay_distribution() -> pd.DataFrame:
+    """Per-station trip counts bucketed into 6 delay bands."""
+    tbls = resolve_tables()
+    stg  = tbls.get("STG_DEPARTURES", "")
+    if not stg:
+        return pd.DataFrame()
+    q = f"""
+    SELECT
+        station_id,
+        CASE
+            WHEN delay_minutes <= 0  THEN 'On Time'
+            WHEN delay_minutes <= 2  THEN '0–2 min'
+            WHEN delay_minutes <= 5  THEN '2–5 min'
+            WHEN delay_minutes <= 10 THEN '5–10 min'
+            WHEN delay_minutes <= 20 THEN '10–20 min'
+            ELSE                          '20+ min'
+        END AS delay_band,
+        COUNT(*) AS trip_count,
+        ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (PARTITION BY station_id), 1) AS pct_of_station
+    FROM {stg}
+    GROUP BY station_id, delay_band
+    ORDER BY station_id, delay_band
+    """
+    with _db_conn() as con:
+        return safe_df(con, q)
+
+
+@st.cache_data(ttl=120)
+def get_delay_severity_summary() -> pd.DataFrame:
+    """Per-station on-time %, severe %, P50, P95 delay."""
+    tbls = resolve_tables()
+    stg  = tbls.get("STG_DEPARTURES", "")
+    if not stg:
+        return pd.DataFrame()
+    q = f"""
+    SELECT
+        station_id,
+        COUNT(*) AS total_trips,
+        ROUND(100.0 * SUM(CASE WHEN delay_minutes <= 0  THEN 1 ELSE 0 END)
+              / GREATEST(COUNT(*), 1), 1) AS pct_on_time,
+        ROUND(100.0 * SUM(CASE WHEN delay_minutes >  5  THEN 1 ELSE 0 END)
+              / GREATEST(COUNT(*), 1), 1) AS pct_severe,
+        ROUND(100.0 * SUM(CASE WHEN delay_minutes > 20  THEN 1 ELSE 0 END)
+              / GREATEST(COUNT(*), 1), 1) AS pct_crisis,
+        ROUND(AVG(delay_minutes), 2)      AS avg_delay,
+        ROUND(MAX(delay_minutes), 1)      AS max_delay,
+        PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY delay_minutes) AS median_delay,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY delay_minutes) AS p95_delay
+    FROM {stg}
+    GROUP BY station_id
+    ORDER BY pct_severe DESC
+    """
+    with _db_conn() as con:
+        return safe_df(con, q)
 
 
 # =============================================================================
@@ -823,22 +743,13 @@ def get_predictions_detail(station_filter: str = "All Stations") -> pd.DataFrame
 # =============================================================================
 
 def human_age(ts) -> str:
-    """
-    FIX 8 (CORRECTED): expected_datetime is Stockholm local time (naive).
-    Compare the stored value directly against datetime.now() — both are naive
-    local time so the difference is correct without any tz conversion.
-
-    Previous attempt used TZ_STOCKHOLM-aware comparison which over-corrected
-    and gave a duration off by the UTC offset in the opposite direction.
-    """
     if ts is None:
         return "unknown"
     try:
         dt = pd.to_datetime(ts).to_pydatetime()
-        # Strip tz-info if DuckDB returned a tz-aware object
         if dt.tzinfo is not None:
             dt = dt.replace(tzinfo=None)
-        diff = datetime.now() - dt         # both naive local → correct duration
+        diff = datetime.now() - dt
         sec  = int(diff.total_seconds())
         if sec < 0:    return "just now"
         if sec < 60:   return f"{sec}s ago"
@@ -853,9 +764,9 @@ def r5_alert(html_msg: str) -> None:
 
 
 def hero_header(last_update, refresh_seconds: int) -> None:
+    """Clean hero — LIVE status + Last Update timestamp only."""
     pulse     = "🟢 LIVE" if last_update else "⚪ NO DATA"
     local_str = _fmt_local(last_update)
-
     st.markdown(f"""
 <div class="r5-hero">
   <div class="r5-hero-inner">
@@ -880,8 +791,7 @@ def hero_header(last_update, refresh_seconds: int) -> None:
       </div>
       <div style="min-width:200px;">
         <div class="r5-badge" style="justify-content:space-between;">
-          <span>🕒 Last Update</span>
-          <span>{local_str}</span>
+          <span>🕒 Last Update</span><span>{local_str}</span>
         </div>
       </div>
     </div>
@@ -890,10 +800,8 @@ def hero_header(last_update, refresh_seconds: int) -> None:
 """, unsafe_allow_html=True)
 
 
-def kpi_card(
-    title: str, value: str, subtitle: str, color: str,
-    badge: str | None = None,
-) -> None:
+def kpi_card(title: str, value: str, subtitle: str, color: str,
+             badge: str | None = None) -> None:
     badge_html = f'<span class="r5-pill">{badge}</span>' if badge else ""
     st.markdown(f"""
 <div class="r5-kpi-card r5-leftbar" style="border-left-color:{color};">
@@ -909,11 +817,8 @@ def progress_card(title: str, value_pct: float) -> None:
     st.markdown(f"""
 <div class="r5-white-card">
   <div style="font-size:20px;font-weight:950;margin-bottom:10px;">{title}</div>
-  <div style="font-size:44px;font-weight:950;color:#16a34a;margin-bottom:14px;">
-    {v:.1f}%
-  </div>
-  <div style="width:100%;height:14px;background:#e5e7eb;
-              border-radius:999px;overflow:hidden;">
+  <div style="font-size:44px;font-weight:950;color:#16a34a;margin-bottom:14px;">{v:.1f}%</div>
+  <div style="width:100%;height:14px;background:#e5e7eb;border-radius:999px;overflow:hidden;">
     <div style="width:{v:.2f}%;height:100%;background:#16a34a;"></div>
   </div>
 </div>
@@ -921,10 +826,6 @@ def progress_card(title: str, value_pct: float) -> None:
 
 
 def ml_accuracy_card(metrics: dict) -> None:
-    """
-    [ML] Homepage ML card — shows real metrics from model_metrics.json.
-    Falls back to a 'Model not trained yet' state when metrics is empty.
-    """
     if not metrics:
         st.markdown("""
 <div class="r5-white-card">
@@ -936,21 +837,17 @@ def ml_accuracy_card(metrics: dict) -> None:
 </div>
 """, unsafe_allow_html=True)
         return
-
-    acc     = float(metrics.get("accuracy_pct", 0.0))
-    mae     = metrics.get("test_mae",  "—")
-    r2      = metrics.get("test_r2",   "—")
-    trained = metrics.get("trained_at", "")
+    acc         = float(metrics.get("accuracy_pct", 0.0))
+    mae         = metrics.get("test_mae",  "—")
+    r2          = metrics.get("test_r2",   "—")
+    trained     = metrics.get("trained_at", "")
     trained_fmt = trained[:16].replace("T", " ") if trained else "unknown"
-    n_feat  = metrics.get("n_features", "—")
-
-    # colour based on accuracy
-    col = "#16a34a" if acc >= 80 else ("#eab308" if acc >= 60 else "#dc2626")
-    bar = min(acc, 100)
-
+    n_feat      = metrics.get("n_features", "—")
+    col         = "#16a34a" if acc >= 80 else ("#eab308" if acc >= 60 else "#dc2626")
     st.markdown(f"""
 <div class="r5-white-card">
-  <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px;">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;
+              flex-wrap:wrap;gap:10px;">
     <div>
       <div style="font-size:18px;font-weight:950;margin-bottom:4px;">ML Prediction Accuracy</div>
       <div style="font-size:11px;font-weight:700;color:#9ca3af;">
@@ -964,7 +861,7 @@ def ml_accuracy_card(metrics: dict) -> None:
   </div>
   <div style="font-size:42px;font-weight:950;color:{col};margin:8px 0 6px;">{acc:.1f}%</div>
   <div style="width:100%;height:10px;background:#e5e7eb;border-radius:999px;overflow:hidden;">
-    <div style="width:{bar:.1f}%;height:100%;background:{col};
+    <div style="width:{min(acc,100):.1f}%;height:100%;background:{col};
                 transition:width 0.4s ease;"></div>
   </div>
   <div style="font-size:11px;font-weight:700;color:#9ca3af;margin-top:6px;">
@@ -1026,20 +923,16 @@ def main() -> None:
         st.code(stats["__error__"])
         st.stop()
     if "__locked__" in stats:
-        st.warning("⏳ DuckDB is being written to by Dagster — showing last cached data. Refreshing shortly...")
-        # Don't stop — fall through with whatever cached stats we have
+        st.warning("⏳ DuckDB is being written to by Dagster — showing last cached data.")
         stats = {k: v for k, v in stats.items() if k != "__locked__"}
         if not stats:
             st.stop()
 
     # ── Hero ───────────────────────────────────────────────────────────────
-    hero_header(
-        last_update=stats.get("last_update"),
-        refresh_seconds=int(refresh_seconds),
-    )
+    hero_header(last_update=stats.get("last_update"), refresh_seconds=int(refresh_seconds))
     st.write("")
 
-    # ── 4 top KPI cards ────────────────────────────────────────────────────
+    # ── Top 4 KPI cards ────────────────────────────────────────────────────
     c1, c2, c3, c4 = st.columns(4)
 
     with c1:
@@ -1047,7 +940,7 @@ def main() -> None:
         kpi_card(
             "AVERAGE DELAY",
             f"{stats['avg_delay']:.1f} min",
-            f"Avg across all stations: {window_lbl}",
+            f"Avg across all stations · {window_lbl}",
             "#e02a2a",
             badge="HIGH" if stats["avg_delay"] > 5 else None,
         )
@@ -1057,25 +950,19 @@ def main() -> None:
         kpi_card(
             "CONGESTION LEVEL",
             f"{cong:.0f}%",
-            # FIX 2: meaningful thresholds now that formula is rate-based
-            "Low"      if cong < 25 else
-            "Moderate" if cong < 50 else
-            "High"     if cong < 75 else "Severe",
+            "Low" if cong < 25 else "Moderate" if cong < 50 else "High" if cong < 75 else "Severe",
             "#ea580c",
             badge="PEAK" if cong > 75 else None,
         )
 
     with c3:
-        # Bottleneck Line — which single line is causing most disruption right now
-        # Pulled from live stats significant_delays as proxy; full detail in insights
         dl    = stats.get("disrupted_lines", 0)
-        total = stats.get("total_departures", 1)
         dis_r = stats.get("disruption_rate", 0)
         bl_color = "#dc2626" if dis_r > 50 else "#eab308" if dis_r > 20 else "#16a34a"
         kpi_card(
             "🚌 DISRUPTION RATE",
             f"{dis_r:.0f}%",
-            f"{dl} disrupted line{'s' if dl != 1 else ''} of {stats.get('active_lines',0)} active",
+            f"{dl} disrupted line{'s' if dl != 1 else ''} of {stats.get('active_lines', 0)} active",
             bl_color,
             badge="CONTACT OP" if dis_r > 50 else None,
         )
@@ -1103,25 +990,20 @@ def main() -> None:
     st.write("")
 
     # ── Tabs ───────────────────────────────────────────────────────────────
-    live_tab, ai_tab, analysis_tab = st.tabs(
-        ["🔴 Live Stream", "🤖 AI Predictions", "📋 Analysis"]
+    live_tab, analysis_tab, ai_tab = st.tabs(
+        ["🔴 Live Stream", "📋 Analysis", "🤖 AI Predictions"]
     )
 
     # ════════════════════════════════════════
     # TAB 1 — LIVE STREAM
     # ════════════════════════════════════════
     with live_tab:
-        # FIX 7: opening tag always matched by closing </div> at bottom of tab
         st.markdown("""
 <div class="r5-white-card">
-  <div style="display:flex;justify-content:space-between;
-              align-items:center;gap:12px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
     <div style="font-size:26px;font-weight:950;">🔴 Live Stream</div>
-    <div style="background:rgba(239,68,68,0.12);
-         border:1px solid rgba(239,68,68,0.25);
-         color:#ef4444;font-weight:950;border-radius:999px;padding:8px 14px;">
-      ● LIVE
-    </div>
+    <div style="background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.25);
+         color:#ef4444;font-weight:950;border-radius:999px;padding:8px 14px;">● LIVE</div>
   </div>
 """, unsafe_allow_html=True)
 
@@ -1130,11 +1012,9 @@ def main() -> None:
         if df_live.empty:
             r5_alert(
                 "<strong>No live data in the last 30 minutes.</strong> "
-                "Ensure <code>stg_departures</code> exists and the ingestion "
-                "pipeline is running."
+                "Ensure <code>stg_departures</code> exists and the ingestion pipeline is running."
             )
         else:
-            
             df_plot = df_live.copy()
             try:
                 df_plot["ts_local"] = (
@@ -1142,7 +1022,7 @@ def main() -> None:
                     .dt.tz_convert("Europe/Stockholm")
                 )
             except Exception:
-                df_plot["ts_local"] = df_plot["ts_min"]  
+                df_plot["ts_local"] = df_plot["ts_min"]
 
             fig = go.Figure()
             fig.add_trace(go.Scatter(
@@ -1164,26 +1044,19 @@ def main() -> None:
                 template="plotly_white", height=520,
                 margin=dict(l=10, r=10, t=20, b=10),
                 hovermode="x unified",
-                legend=dict(
-                    orientation="h", yanchor="bottom",
-                    y=-0.18, xanchor="center", x=0.5,
-                ),
+                legend=dict(orientation="h", yanchor="bottom", y=-0.18, xanchor="center", x=0.5),
                 xaxis=dict(title="Stockholm local time", tickformat="%H:%M"),
                 yaxis=dict(title="Delay (min)"),
-                yaxis2=dict(
-                    title="Congestion % / Departures",
-                    overlaying="y", side="right", showgrid=False,
-                ),
+                yaxis2=dict(title="Congestion % / Departures",
+                            overlaying="y", side="right", showgrid=False),
             )
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-            # ── 2 Business Insight cards ──────────────────────────────────
+            # ── 2 insight cards ───────────────────────────────────────────
             insights = get_live_business_insights()
-
-            k1, k2 = st.columns(2)
+            k1, k2  = st.columns(2)
 
             with k1:
-                # Network Health Score — composite 0-100
                 nh       = float(insights.get("network_health_score", 0))
                 n_rep    = int(insights.get("network_reporting", 0))
                 n_ot     = float(insights.get("network_on_time", 0))
@@ -1198,7 +1071,6 @@ def main() -> None:
                 )
 
             with k2:
-                # Delay Trend — improving / stable / worsening vs 5 min ago
                 kpi_card(
                     "📈 DELAY TREND",
                     insights.get("trend_label", "—").split("  ")[0],
@@ -1213,21 +1085,19 @@ def main() -> None:
     # ════════════════════════════════════════
     with ai_tab:
 
-        ml_metrics = get_ml_metrics()
-        fi_df      = get_feature_importance()
-
-        # ── Model status banner ────────────────────────────────────────────
+        ml_metrics  = get_ml_metrics()
+        fi_df       = get_feature_importance()
         model_trained = bool(ml_metrics)
-        acc_pct = float(ml_metrics.get("accuracy_pct", 0.0))
+        acc_pct    = float(ml_metrics.get("accuracy_pct", 0.0))
         trained_at = ml_metrics.get("trained_at", "")
         trained_fmt = trained_at[:16].replace("T", " ") if trained_at else "—"
 
-        status_cls  = "r5-model-ok"   if model_trained and acc_pct >= 70 else \
-                      "r5-model-warn" if model_trained else "r5-model-none"
-        status_icon = "✅" if model_trained and acc_pct >= 70 else \
-                      "⚠️" if model_trained else "❌"
-        status_txt  = f"Model ready · trained {trained_fmt}" if model_trained else \
-                      "No model found — run ENABLE_ML=1 and trigger Dagster schedule"
+        status_cls  = ("r5-model-ok"   if model_trained and acc_pct >= 70 else
+                       "r5-model-warn" if model_trained else "r5-model-none")
+        status_icon = ("✅" if model_trained and acc_pct >= 70 else
+                       "⚠️" if model_trained else "❌")
+        status_txt  = (f"Model ready · trained {trained_fmt}" if model_trained else
+                       "No model found — run ENABLE_ML=1 and trigger Dagster schedule")
 
         st.markdown(f"""
 <div class="r5-ai-hero">
@@ -1247,56 +1117,46 @@ def main() -> None:
 
         if not model_trained:
             r5_alert(
-                "No trained model found. "
-                "To train: set <code>ENABLE_ML=1</code> and trigger the "
-                "<code>weekly_model_training</code> Dagster schedule, or run:<br>"
+                "No trained model found. To train: set <code>ENABLE_ML=1</code> and trigger "
+                "the <code>weekly_model_training</code> Dagster schedule, or run:<br>"
                 "<code>python ml_models/congestion_predictor.py train</code>"
             )
         else:
-            # ── [ML] 4 Model Metric KPI cards ─────────────────────────────
             m1, m2, m3, m4 = st.columns(4)
             with m1:
-                st.markdown(f"""
-<div class="r5-ml-metric">
+                st.markdown(f"""<div class="r5-ml-metric">
   <div class="r5-ml-label">Test MAE</div>
   <div class="r5-ml-val">{ml_metrics.get("test_mae","—")}</div>
   <div class="r5-ml-sub">Mean absolute error (lower = better)</div>
 </div>""", unsafe_allow_html=True)
             with m2:
-                st.markdown(f"""
-<div class="r5-ml-metric">
+                st.markdown(f"""<div class="r5-ml-metric">
   <div class="r5-ml-label">Test R²</div>
   <div class="r5-ml-val">{ml_metrics.get("test_r2","—")}</div>
   <div class="r5-ml-sub">Variance explained (higher = better)</div>
 </div>""", unsafe_allow_html=True)
             with m3:
-                st.markdown(f"""
-<div class="r5-ml-metric">
+                st.markdown(f"""<div class="r5-ml-metric">
   <div class="r5-ml-label">CV MAE</div>
   <div class="r5-ml-val">{ml_metrics.get("cv_mae","—")}</div>
   <div class="r5-ml-sub">5-fold time-series cross-validation</div>
 </div>""", unsafe_allow_html=True)
             with m4:
-                st.markdown(f"""
-<div class="r5-ml-metric">
+                st.markdown(f"""<div class="r5-ml-metric">
   <div class="r5-ml-label">Features</div>
   <div class="r5-ml-val">{ml_metrics.get("n_features","—")}</div>
   <div class="r5-ml-sub">{ml_metrics.get("n_training","—")} train · {ml_metrics.get("n_test","—")} test rows</div>
 </div>""", unsafe_allow_html=True)
-
             st.write("")
 
-        # ── Load predictions ───────────────────────────────────────────────
         pred_raw = get_predictions()
-
         if pred_raw.empty:
             r5_alert(
                 "<strong>No predictions available yet.</strong> "
-                "Run the model: <code>python ml_models/congestion_predictor.py predict</code> "
+                "Run: <code>python ml_models/congestion_predictor.py predict</code> "
                 "or trigger the <code>daily_prediction_generation</code> Dagster schedule."
             )
         else:
-            # Normalise columns
             pred_raw.columns = [c.lower() for c in pred_raw.columns]
             for col in ("timestamp", "date"):
                 if col in pred_raw.columns:
@@ -1305,69 +1165,44 @@ def main() -> None:
                 day_map = {0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"}
                 pred_raw["day_name"] = pred_raw["day_of_week"].map(day_map)
 
-            # ── Station selector ───────────────────────────────────────────
             stations_avail = ["All Stations"]
             if "station_name" in pred_raw.columns:
                 stations_avail += sorted(pred_raw["station_name"].dropna().unique().tolist())
-
             sel_col, _ = st.columns([2, 3])
             with sel_col:
-                station_sel = st.selectbox(
-                    "🚉 Station forecast", stations_avail, key="pred_station"
-                )
+                station_sel = st.selectbox("🚉 Station forecast", stations_avail, key="pred_station")
 
-            if station_sel == "All Stations":
-                df_plot = pred_raw.copy()
-            else:
-                df_plot = pred_raw[pred_raw["station_name"] == station_sel].copy()
+            df_plot = (pred_raw.copy() if station_sel == "All Stations"
+                       else pred_raw[pred_raw["station_name"] == station_sel].copy())
 
-            # ── 7-day hourly forecast line chart ──────────────────────────
-            #st.markdown('<div class="r5-white-card">', unsafe_allow_html=True)
-            st.markdown( f"""<div class="r5-white-card">
-                <div style="font-size:22px;font-weight:950;margin-bottom:14px;">
-                📈 7-Day Hourly Forecast
-                {"  — " + station_sel if station_sel != "All Stations" else " — All Stations (avg)"}
-                </div>""", unsafe_allow_html=True,
-            )
+            # 7-day forecast chart
+            st.markdown(f"""<div class="r5-white-card">
+  <div style="font-size:22px;font-weight:950;margin-bottom:14px;">
+    📈 7-Day Hourly Forecast{"  — " + station_sel if station_sel != "All Stations" else " — All Stations (avg)"}
+  </div>""", unsafe_allow_html=True)
 
             if "timestamp" in df_plot.columns and "predicted_congestion" in df_plot.columns:
-                if station_sel == "All Stations":
-                    chart_df = (
-                        df_plot.groupby("timestamp", as_index=False)["predicted_congestion"].mean()
-                    )
-                else:
-                    chart_df = df_plot[["timestamp", "predicted_congestion"]].copy()
-
-                # Background colour bands by congestion level
+                chart_df = (
+                    df_plot.groupby("timestamp", as_index=False)["predicted_congestion"].mean()
+                    if station_sel == "All Stations"
+                    else df_plot[["timestamp", "predicted_congestion"]].copy()
+                )
                 fig_fc = go.Figure()
-
-                # Shaded regions for levels
-                x_min = chart_df["timestamp"].min()
-                x_max = chart_df["timestamp"].max()
-                for band_y0, band_y1, band_col, band_lbl in [
-                    (0,  25,  "rgba(16,185,129,0.08)",  "Low"),
-                    (25, 50,  "rgba(234,179,8,0.08)",   "Moderate"),
-                    (50, 75,  "rgba(249,115,22,0.08)",  "High"),
-                    (75, 100, "rgba(239,68,68,0.08)",   "Critical"),
+                for b0, b1, bc, bl in [
+                    (0,25,"rgba(16,185,129,0.08)","Low"),
+                    (25,50,"rgba(234,179,8,0.08)","Moderate"),
+                    (50,75,"rgba(249,115,22,0.08)","High"),
+                    (75,100,"rgba(239,68,68,0.08)","Critical"),
                 ]:
-                    fig_fc.add_hrect(
-                        y0=band_y0, y1=band_y1, fillcolor=band_col,
-                        line_width=0, annotation_text=band_lbl,
-                        annotation_position="right",
-                        annotation_font=dict(size=10, color="#9ca3af"),
-                    )
-
+                    fig_fc.add_hrect(y0=b0, y1=b1, fillcolor=bc, line_width=0,
+                                     annotation_text=bl, annotation_position="right",
+                                     annotation_font=dict(size=10, color="#9ca3af"))
                 fig_fc.add_trace(go.Scatter(
-                    x=chart_df["timestamp"],
-                    y=chart_df["predicted_congestion"],
-                    mode="lines",
-                    name="Predicted Congestion",
-                    line=dict(width=2.5, color="#4f46e5"),
-                    fill="tozeroy",
-                    fillcolor="rgba(79,70,229,0.08)",
+                    x=chart_df["timestamp"], y=chart_df["predicted_congestion"],
+                    mode="lines", line=dict(width=2.5, color="#4f46e5"),
+                    fill="tozeroy", fillcolor="rgba(79,70,229,0.08)",
                     hovertemplate="%{x|%a %d %b %H:%M}<br>Congestion: <b>%{y:.1f}%</b><extra></extra>",
                 ))
-
                 fig_fc.update_layout(
                     template="plotly_white", height=380,
                     margin=dict(l=10, r=80, t=10, b=10),
@@ -1378,51 +1213,33 @@ def main() -> None:
                 )
                 st.plotly_chart(fig_fc, use_container_width=True, config={"displayModeBar": False})
             else:
-                r5_alert("Prediction data is missing required columns (timestamp, predicted_congestion).")
+                r5_alert("Prediction data missing required columns (timestamp, predicted_congestion).")
             st.markdown("</div>", unsafe_allow_html=True)
-
             st.write("")
 
-            # ── Row 2: Peak-hour heatmap  |  Station ranking ──────────────
+            # Heatmap | Station ranking
             col_heat, col_rank = st.columns(2)
 
             with col_heat:
-                st.markdown('<div class="r5-white-card">'
-                '<div style="font-size:20px;font-weight:950;margin-bottom:12px;">'
+                st.markdown(
+                    '<div class="r5-white-card">'
+                    '<div style="font-size:20px;font-weight:950;margin-bottom:12px;">'
                     '🕐 Peak Hour Heatmap</div>',
                     unsafe_allow_html=True,
                 )
-
-                if "hour" in df_plot.columns and "day_of_week" in df_plot.columns \
-                        and "predicted_congestion" in df_plot.columns:
-                    heat_df = (
-                        df_plot.groupby(["day_of_week", "hour"], as_index=False)
-                        ["predicted_congestion"].mean()
-                    )
-                    heat_pivot = heat_df.pivot(
-                        index="day_of_week", columns="hour", values="predicted_congestion"
-                    ).fillna(0)
-
+                if all(c in df_plot.columns for c in ("hour","day_of_week","predicted_congestion")):
+                    heat_df    = df_plot.groupby(["day_of_week","hour"], as_index=False)["predicted_congestion"].mean()
+                    heat_pivot = heat_df.pivot(index="day_of_week", columns="hour", values="predicted_congestion").fillna(0)
                     day_labels = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
                     y_labels   = [day_labels[i] for i in heat_pivot.index if i < 7]
-
                     fig_heat = go.Figure(go.Heatmap(
-                        z=heat_pivot.values,
-                        x=list(heat_pivot.columns),
-                        y=y_labels,
-                        colorscale=[
-                            [0.0,  "#d1fae5"],
-                            [0.25, "#fef3c7"],
-                            [0.5,  "#fed7aa"],
-                            [0.75, "#fecaca"],
-                            [1.0,  "#991b1b"],
-                        ],
+                        z=heat_pivot.values, x=list(heat_pivot.columns), y=y_labels,
+                        colorscale=[[0.0,"#d1fae5"],[0.25,"#fef3c7"],[0.5,"#fed7aa"],
+                                    [0.75,"#fecaca"],[1.0,"#991b1b"]],
                         zmin=0, zmax=100,
-                        colorbar=dict(
-                            title="Cong %", thickness=12,
-                            tickvals=[0, 25, 50, 75, 100],
-                            ticktext=["0", "25", "50", "75", "100"],
-                        ),
+                        colorbar=dict(title="Cong %", thickness=6,
+                                      tickvals=[0,25,50,75,100],
+                                      ticktext=["0","25","50","75","100"], len=0.8),
                         hovertemplate="%{y} %{x}:00 → <b>%{z:.0f}%</b><extra></extra>",
                     ))
                     fig_heat.update_layout(
@@ -1431,38 +1248,26 @@ def main() -> None:
                         xaxis=dict(title="Hour of day", dtick=3),
                         yaxis=dict(title=""),
                     )
-                    st.plotly_chart(fig_heat, use_container_width=True,
-                                   config={"displayModeBar": False})
+                    st.plotly_chart(fig_heat, use_container_width=True, config={"displayModeBar": False})
                 else:
                     r5_alert("Need hour & day_of_week columns for heatmap.")
                 st.markdown("</div>", unsafe_allow_html=True)
 
             with col_rank:
-                st.markdown('<div class="r5-white-card">', unsafe_allow_html=True)
                 st.markdown(
+                    '<div class="r5-white-card">'
                     '<div style="font-size:20px;font-weight:950;margin-bottom:12px;">'
                     '🏆 Station Congestion Ranking</div>',
                     unsafe_allow_html=True,
                 )
-
                 if "station_name" in pred_raw.columns and "predicted_congestion" in pred_raw.columns:
-                    rank_df = (
-                        pred_raw.groupby("station_name", as_index=False)
-                        ["predicted_congestion"].mean()
-                        .sort_values("predicted_congestion", ascending=True)
-                    )
-                    colours = [
-                        "#991b1b" if v >= 75 else
-                        "#9a3412" if v >= 50 else
-                        "#92400e" if v >= 25 else
-                        "#065f46"
-                        for v in rank_df["predicted_congestion"]
-                    ]
+                    rank_df = (pred_raw.groupby("station_name", as_index=False)["predicted_congestion"].mean()
+                               .sort_values("predicted_congestion", ascending=True))
+                    colours = ["#991b1b" if v>=75 else "#9a3412" if v>=50 else "#92400e" if v>=25 else "#065f46"
+                               for v in rank_df["predicted_congestion"]]
                     fig_rank = go.Figure(go.Bar(
-                        x=rank_df["predicted_congestion"],
-                        y=rank_df["station_name"],
-                        orientation="h",
-                        marker_color=colours,
+                        x=rank_df["predicted_congestion"], y=rank_df["station_name"],
+                        orientation="h", marker_color=colours,
                         text=[f"{v:.1f}%" for v in rank_df["predicted_congestion"]],
                         textposition="outside",
                         hovertemplate="%{y}: <b>%{x:.1f}%</b><extra></extra>",
@@ -1473,42 +1278,29 @@ def main() -> None:
                         xaxis=dict(title="Avg predicted congestion", range=[0, 110]),
                         yaxis=dict(title=""),
                     )
-                    st.plotly_chart(fig_rank, use_container_width=True,
-                                   config={"displayModeBar": False})
+                    st.plotly_chart(fig_rank, use_container_width=True, config={"displayModeBar": False})
                 else:
                     r5_alert("No station_name column in predictions.")
                 st.markdown("</div>", unsafe_allow_html=True)
 
-            # ── Feature importance chart ───────────────────────────────────
+            # Feature importance
             if not fi_df.empty and "feature" in fi_df.columns and "importance" in fi_df.columns:
                 st.write("")
-                st.markdown('<div class="r5-white-card">', unsafe_allow_html=True)
                 st.markdown(
+                    '<div class="r5-white-card">'
                     '<div style="font-size:20px;font-weight:950;margin-bottom:12px;">'
                     '🔍 Feature Importance  <span style="font-size:13px;font-weight:700;'
                     'color:#9ca3af;">(top 15 — what drives congestion predictions)</span></div>',
                     unsafe_allow_html=True,
                 )
-                fi_top = fi_df.nlargest(15, "importance")
-                # Clean feature names for display
-                fi_top = fi_top.copy()
-                fi_top["feature_label"] = (
-                    fi_top["feature"]
-                    .str.replace("_", " ")
-                    .str.replace("congestion score", "cong")
-                    .str.title()
-                )
+                fi_top = fi_df.nlargest(15, "importance").copy()
+                fi_top["feature_label"] = (fi_top["feature"].str.replace("_"," ")
+                                           .str.replace("congestion score","cong").str.title())
                 fig_fi = go.Figure(go.Bar(
-                    x=fi_top["importance"],
-                    y=fi_top["feature_label"],
-                    orientation="h",
-                    marker=dict(
-                        color=fi_top["importance"],
-                        colorscale=[[0,"#e0e7ff"],[1,"#4f46e5"]],
-                        showscale=False,
-                    ),
-                    text=[f"{v:.3f}" for v in fi_top["importance"]],
-                    textposition="outside",
+                    x=fi_top["importance"], y=fi_top["feature_label"], orientation="h",
+                    marker=dict(color=fi_top["importance"],
+                                colorscale=[[0,"#e0e7ff"],[1,"#4f46e5"]], showscale=False),
+                    text=[f"{v:.3f}" for v in fi_top["importance"]], textposition="outside",
                     hovertemplate="%{y}: <b>%{x:.4f}</b><extra></extra>",
                 ))
                 fig_fi.update_layout(
@@ -1517,67 +1309,160 @@ def main() -> None:
                     xaxis=dict(title="Importance score"),
                     yaxis=dict(title="", autorange="reversed"),
                 )
-                st.plotly_chart(fig_fi, use_container_width=True,
-                               config={"displayModeBar": False})
+                st.plotly_chart(fig_fi, use_container_width=True, config={"displayModeBar": False})
                 st.markdown("</div>", unsafe_allow_html=True)
 
     # ════════════════════════════════════════
-    # TAB 3 — ANALYSIS
+    # TAB 3 — DELAY DISTRIBUTION (Option C)
     # ════════════════════════════════════════
     with analysis_tab:
+
         st.markdown("""
-<div class="r5-white-card">
-  <div style="font-size:28px;font-weight:700;margin-bottom:16px;">Deep Analysis</div>
-""", unsafe_allow_html=True)
-
-        df_station = get_station_performance(limit=10)
-
-        if df_station.empty:
-            r5_alert(
-                "<strong>No station performance data found.</strong> "
-                "Build <code>fact_station_performance</code> first: "
-                "<code>dbt build --select fact_station_performance</code>"
-            )
-        else:
-            left_col, right_col = st.columns(2)
-            cols = [left_col, right_col]
-
-            for i, row in enumerate(df_station.itertuples(index=False)):
-                on_time_val = float(row.on_time_rate      or 0)
-                delay_val   = float(row.avg_delay_minutes  or 0)
-                dep_val     = int(  row.total_departures   or 0)
-
-                ot_colour = (
-                    "#16a34a" if on_time_val >= 80 else
-                    "#eab308" if on_time_val >= 60 else
-                    "#dc2626"
-                )
-
-                with cols[i % 2]:
-                    st.markdown(f"""
-<div style="border:1px solid rgba(0,0,0,0.10);border-radius:14px;
-            padding:16px;margin-bottom:14px;background:white;">
-  <div style="font-weight:950;font-size:18px;margin-bottom:10px;">
-    {row.station_name}
-  </div>
-  <div style="font-size:13px;margin-bottom:6px;">
-    <span style="color:#111827;font-weight:800;">Departures:</span> {dep_val:,}
-  </div>
-  <div style="font-size:13px;margin-bottom:6px;">
-    <span style="color:#dc2626;font-weight:900;">Avg Delay:</span> {delay_val:.1f} min
-  </div>
-  <div style="font-size:13px;margin-bottom:10px;">
-    <span style="color:{ot_colour};font-weight:900;">On-Time:</span> {on_time_val:.0f}%
-  </div>
-  <div style="width:100%;height:8px;background:#e5e7eb;
-              border-radius:999px;overflow:hidden;">
-    <div style="width:{min(on_time_val, 100):.1f}%;height:100%;
-                background:{ot_colour};"></div>
+<div class="r5-ai-hero" style="background:linear-gradient(90deg,#0f766e 0%,#0369a1 60%,#1d4ed8 100%);">
+  <div style="font-size:36px;font-weight:950;">🔔 Delay Distribution Analysis</div>
+  <div style="font-size:15px;font-weight:800;opacity:0.9;margin-top:6px;">
+    Are delays small &amp; frequent  or rare but severe? · All collected data
   </div>
 </div>
 """, unsafe_allow_html=True)
+        st.write("")
 
-        st.markdown("</div>", unsafe_allow_html=True)
+        df_dist    = get_delay_distribution()
+        df_summary = get_delay_severity_summary()
+
+        if df_dist.empty or df_summary.empty:
+            r5_alert(
+                "<strong>No delay data found.</strong> "
+                "Ensure ingestion is running: <code>dagster dev -f dagster_app1.py</code>"
+            )
+        else:
+            # Map station_id → name (module-level STOCKHOLM_STATIONS — no local import needed)
+            df_dist["station_name"]    = df_dist["station_id"].map(
+                lambda x: STOCKHOLM_STATIONS.get(int(x), f"Station {x}")
+            )
+            df_summary["station_name"] = df_summary["station_id"].map(
+                lambda x: STOCKHOLM_STATIONS.get(int(x), f"Station {x}")
+            )
+
+            # 3 network KPI cards
+            total_trips = int(df_summary["total_trips"].sum())
+            avg_on_time = round(float(df_summary["pct_on_time"].mean()), 1)
+            avg_severe  = round(float(df_summary["pct_severe"].mean()), 1)
+            worst_row   = df_summary.loc[df_summary["pct_severe"].idxmax()]
+            best_row    = df_summary.loc[df_summary["pct_on_time"].idxmax()]
+            p95_net     = round(float(df_summary["p95_delay"].mean()), 1)
+
+            ka, kb, kc = st.columns(3)
+            with ka:
+                kpi_card("✅ NETWORK ON-TIME", f"{avg_on_time:.1f}%",
+                         f"Avg across all stations · {total_trips:,} total trips",
+                         "#16a34a" if avg_on_time >= 80 else "#eab308")
+            with kb:
+                kpi_card("⚠️ SEVERE DELAY RATE", f"{avg_severe:.1f}%",
+                         f"Trips delayed >5 min · worst: {worst_row['station_name']}",
+                         "#dc2626" if avg_severe > 10 else "#eab308" if avg_severe > 5 else "#16a34a",
+                         badge="ACTION" if avg_severe > 10 else None)
+            with kc:
+                kpi_card("📊 WORST-CASE DELAY", f"{p95_net:.1f} min",
+                         f"95% of trips delayed less than this · best: {best_row['station_name']}",
+                         "#4f46e5")
+
+            st.write("")
+
+            # Stacked bar
+            band_order  = ["On Time","0–2 min","2–5 min","5–10 min","10–20 min","20+ min"]
+            band_colors = {
+                "On Time":"#16a34a","0–2 min":"#86efac","2–5 min":"#fde047",
+                "5–10 min":"#fb923c","10–20 min":"#ef4444","20+ min":"#991b1b",
+            }
+
+            st.markdown(
+                '<div class="r5-white-card">'
+                '<div style="font-size:22px;font-weight:950;margin-bottom:6px;">'
+                '📊 Delay Band Breakdown — by Station</div>'
+                '<div style="font-size:13px;font-weight:700;color:#6b7280;margin-bottom:14px;">'
+                "Each bar = 100% of that station's trips. Shows share in each delay band."
+                '</div>',
+                unsafe_allow_html=True,
+            )
+            pivot = (df_dist.pivot_table(index="station_name", columns="delay_band",
+                                         values="pct_of_station", aggfunc="sum")
+                     .fillna(0).reindex(columns=band_order, fill_value=0)
+                     .sort_values("On Time", ascending=True))
+            fig_bar = go.Figure()
+            for band in band_order:
+                if band in pivot.columns:
+                    fig_bar.add_trace(go.Bar(
+                        name=band, y=pivot.index.tolist(), x=pivot[band].tolist(),
+                        orientation="h", marker_color=band_colors[band],
+                        hovertemplate=f"<b>%{{y}}</b><br>{band}: <b>%{{x:.1f}}%</b><extra></extra>",
+                    ))
+            fig_bar.update_layout(
+                barmode="stack", template="plotly_white", height=360,
+                margin=dict(l=10, r=10, t=10, b=10),
+                xaxis=dict(title="% of trips", range=[0, 100]), yaxis=dict(title=""),
+                legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5),
+            )
+            st.plotly_chart(fig_bar, use_container_width=True, config={"displayModeBar": False})
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            st.write("")
+
+            # Station deep-dive
+            st.markdown(
+                '<div class="r5-white-card">'
+                '<div style="font-size:20px;font-weight:950;margin-bottom:12px;">'
+                '🔍 Station Deep-Dive</div>',
+                unsafe_allow_html=True,
+            )
+            sel_col, _ = st.columns([2, 3])
+            with sel_col:
+                selected_stn = st.selectbox(
+                    "Select station",
+                    sorted(df_summary["station_name"].tolist()),
+                    key="dist_station",
+                )
+
+            stn_summary = df_summary[df_summary["station_name"] == selected_stn]
+            stn_dist    = df_dist[df_dist["station_name"] == selected_stn]
+
+            if not stn_summary.empty:
+                s = stn_summary.iloc[0]
+                d1, d2, d3, d4 = st.columns(4)
+                with d1:
+                    kpi_card("TOTAL TRIPS", f"{int(s['total_trips']):,}", "All collected data", "#4f46e5")
+                with d2:
+                    kpi_card("ON TIME", f"{s['pct_on_time']:.1f}%", "Delay ≤ 0 min",
+                             "#16a34a" if s['pct_on_time'] >= 80 else "#eab308")
+                with d3:
+                    kpi_card("SEVERE DELAYS", f"{s['pct_severe']:.1f}%", "Delay > 5 min",
+                             "#dc2626" if s['pct_severe'] > 10 else "#eab308")
+                with d4:
+                    kpi_card("WORST-CASE", f"{s['p95_delay']:.1f} min", "95th percentile delay", "#ea580c")
+
+                st.write("")
+
+                if not stn_dist.empty:
+                    stn_dist_ordered = (stn_dist.set_index("delay_band")
+                                        .reindex(band_order).dropna())
+                    fig_donut = go.Figure(go.Pie(
+                        labels=stn_dist_ordered.index.tolist(),
+                        values=stn_dist_ordered["trip_count"].tolist(),
+                        hole=0.55,
+                        marker_colors=[band_colors.get(b, "#ccc") for b in stn_dist_ordered.index],
+                        textinfo="label+percent",
+                        hovertemplate="%{label}: <b>%{value:,} trips</b> (%{percent})<extra></extra>",
+                    ))
+                    fig_donut.update_layout(
+                        template="plotly_white", height=320,
+                        margin=dict(l=10, r=10, t=10, b=10),
+                        showlegend=False,
+                        annotations=[dict(text=f"<b>{selected_stn}</b>",
+                                          x=0.5, y=0.5, font_size=13, showarrow=False)],
+                    )
+                    st.plotly_chart(fig_donut, use_container_width=True, config={"displayModeBar": False})
+
+            st.markdown("</div>", unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
