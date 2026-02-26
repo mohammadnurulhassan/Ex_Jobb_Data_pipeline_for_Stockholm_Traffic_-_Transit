@@ -1,22 +1,6 @@
 """
 FILE: dashboard/app.py
-Stockholm Traffic Analytics Dashboard — Streamlit Application
-
-Changes applied on top of base:
-  1. _db_conn            — retry logic (5 attempts) so DuckDB lock never crashes dashboard
-  2. get_live_statistics — track window_used; handle __locked__ gracefully
-  3. get_live_business_insights
-                         — removed local `from config` import (was shadowing module-level)
-                         — Network Health uses = 0 / = 1 (DuckDB stores booleans as INT)
-                         — G+J: total delay-minutes today + worst hotspot zone
-  4. get_delay_distribution / get_delay_severity_summary — new fetchers for Analysis tab
-  5. hero_header         — removed Auto-Refresh and Update badges; LIVE + Last Update only
-  6. Top KPI row         — c3 = Disruption Rate, c4 = Worst Station Now
-  7. Average Delay card  — subtitle shows actual window_used (not "Last active window")
-  8. Live tab bottom     — 2 cards only: Network Health + Delay Trend
-  9. Heatmap colorbar    — thickness=6, len=0.8 (slim bar)
- 10. Analysis tab        — Delay Distribution (Option C):
-                           stacked bar + scatter + P95 ranking + station deep-dive donut
+Stockholm Traffic Analytics Dashboard 
 """
 
 from __future__ import annotations

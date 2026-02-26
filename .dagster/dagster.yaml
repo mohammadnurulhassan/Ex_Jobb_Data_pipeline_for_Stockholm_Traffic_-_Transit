@@ -1,0 +1,7 @@
+telemetry:
+  enabled: false
+    ```
+
+    Then tell Dagster to use it — add to your `.env` file:
+    ```
+    DAGSTER_HOME=.dagster
