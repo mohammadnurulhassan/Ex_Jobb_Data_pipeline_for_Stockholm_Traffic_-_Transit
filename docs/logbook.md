@@ -409,8 +409,8 @@ DEPLOYMENT:    Azure Container Instances (2 containers, always-on)
 |---|---|
 | Project setup & API integration | 2–3 |
 | DLT ingestion pipeline | 15–20 |
-| dbt transformations | 10–12 |
-| Dagster orchestration | 10–12 |
+| dbt transformations | 25–30 |
+| Dagster orchestration | 20–25 |
 | Machine learning module | 15–20 |
 | Streamlit dashboard | 25–30 |
 | Docker containerisation | 8–10 |
