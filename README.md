@@ -1,5 +1,4 @@
-# Ex_Jobb_Data_pipeline_for_Stockholm_Traffic_Transit
-The goal of this project is to design and implement a data engineering solution that processes traffic,  public transport, and mobility data for Stockholm. The project will provide insights into traffic  congestion, public transport delays, commuting patterns and predictive modeling of traffic jams. 
+
 # 📡 Stockholm Traffic Analytics
 ### AI-Powered Real-Time Transit Intelligence Platform
 
@@ -11,7 +10,7 @@ The goal of this project is to design and implement a data engineering solution 
 [![Docker](https://img.shields.io/badge/Docker-Containerised-blue)](https://docker.com)
 [![Azure](https://img.shields.io/badge/Azure-Deployed-0078D4)](https://azure.microsoft.com)
 
-> **Bachelor's Thesis Project** — Examensarbete, Sweden  
+> ** Data Engineer ** — Examensarbete,STI, Sweden  
 > A production-grade data pipeline that ingests real-time Stockholm public transit data, transforms it with dbt, trains a machine learning model for congestion prediction, and serves live analytics through a Streamlit dashboard — all orchestrated by Dagster and deployed to Azure.
 
 ---
@@ -209,8 +208,7 @@ cd Ex_Jobb_Data_pipeline_for_Stockholm_Traffic_-_Transit
 ```bash
 python -m venv .venv
 source .venv/Scripts/activate   # Windows Git Bash
-# or
-source .venv/bin/activate        # Linux/Mac
+
 ```
 
 **3 — Install dependencies**
@@ -220,7 +218,7 @@ pip install -r requirements.txt
 
 **4 — Set up environment variables**
 ```bash
-cp .env.example .env
+cp .env
 # Edit .env and add your API keys (see API Keys section)
 ```
 
@@ -323,13 +321,6 @@ ml_model_training         [ml]              ← retrain model
 |---|---|---|
 | `data_volume_sensor` | +50 new rows in `fact_congestion_score` | Trigger ML retraining |
 
-### DuckDB Schema
-
-| Schema | Tables |
-|---|---|
-| `raw_traffic` | `realtime_departures` |
-| `analytics_analytics_staging` | `stg_departures` |
-| `analytics_analytics_marts` | `fact_hourly_delays`, `fact_station_performance`, `fact_congestion_score`, `congestion_predictions` |
 
 ---
 
@@ -399,25 +390,7 @@ docker compose up --build
 
 # Stop
 docker compose down
-
-# View logs
-docker compose logs -f dagster
-docker compose logs -f dashboard
 ```
-
-### Services
-| Container | Image | Ports | CPU | RAM |
-|---|---|---|---|---|
-| `stockholm-dashboard` | `dashboard:latest` | 8501 | 1 | 2GB |
-| `stockholm-dagster` | `dagster:latest` | 3000 | 2 | 4GB |
-
-### Volumes (shared)
-```yaml
-volumes:
-  - ./warehouse:/app/warehouse            # DuckDB file
-  - ./ml_models/saved_models:/app/ml_models/saved_models  # ML models
-```
-
 ---
 
 ## Azure Deployment
@@ -508,7 +481,7 @@ REALTIME_API_KEY=your_key_here
 
 ## License
 
-This project was developed as a Bachelor's thesis (Examensarbete) at **STI — Sweden**.  
+This project was developed as a thesis (Examensarbete) at **STI — Sweden**.  
 Data sourced from [Trafiklab](https://www.trafiklab.se) under their open data license.
 
 ---
