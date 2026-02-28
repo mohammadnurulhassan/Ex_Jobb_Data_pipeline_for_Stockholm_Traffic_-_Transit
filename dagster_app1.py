@@ -378,18 +378,35 @@ _ml_sensors:   list = []
 
 if ENABLE_ML and ML_AVAILABLE:
 
-    # ── Asset 1: Train model ──────────────────────────────────────────────────
+# ── Asset 1: Train model ──────────────────────────────────────────────────
     @asset(
         group_name="ml",
         deps=[congestion_analytics],
         description=(
             "Train the congestion prediction model and save model_metrics.json. "
-            "Triggered daily at 02:00 and by the data-volume sensor."
+            "Triggered daily at 02:00 and by the data-volume sensor. "
+            "Skips gracefully if fewer than 10 records are available."
         ),
     )
     def ml_model_training(context) -> Output[dict]:
         context.log.info("🤖 Training ML model…")
-        _predictor, metrics, model_path = train_and_save_model()
+
+        try:
+            _predictor, metrics, model_path = train_and_save_model()
+        except ValueError as e:
+            # Not enough data yet — skip cleanly instead of failing the run
+            context.log.warning(
+                f"⏭️  ML training skipped — not enough data yet: {e}. "
+                "Will retry automatically once more data accumulates."
+            )
+            return Output(
+                value={"skipped": True, "reason": str(e)},
+                metadata={
+                    "skipped": MetadataValue.bool(True),
+                    "reason":  MetadataValue.text(str(e)),
+                },
+            )
+
         context.log.info(
             f"✅ Model trained — MAE={metrics.get('test_mae')}, "
             f"R²={metrics.get('test_r2')}, accuracy={metrics.get('accuracy_pct')}%"

@@ -151,9 +151,9 @@ class CongestionPredictor:
         with duckdb.connect(self.db_path, read_only=True) as con:
             df = con.execute(query).df()
 
-        if len(df) < 30:
+        if len(df) < 10:
             raise ValueError(
-                f"Insufficient data: only {len(df)} records. Need at least 30."
+                f"Insufficient data: only {len(df)} records. Need at least 10 to train the model."
             )
         return df
 
@@ -606,7 +606,7 @@ class CongestionPredictor:
 
 def train_and_save_model() -> tuple[CongestionPredictor, dict[str, Any], Path]:
     predictor = CongestionPredictor()
-    metrics   = predictor.train_model(min_days=30)
+    metrics   = predictor.train_model(min_days=1)
     model_path = predictor.save_model()
     return predictor, metrics, model_path
 
