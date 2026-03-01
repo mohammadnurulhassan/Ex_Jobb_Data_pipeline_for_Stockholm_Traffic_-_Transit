@@ -2,20 +2,8 @@
 FILE: dagster_app1.py
 Dagster Orchestration for Stockholm Traffic (DLT -> dbt -> analytics -> optional ML)
 
-FIXES APPLIED:
-  [F1] Added missing _is_duckdb_locked() helper (was called but never defined → NameError).
-  [F2] Removed duplicate run_dlt_pipeline() call that always ran after the retry loop.
-  [F3] All DuckDB connections now use try/finally: conn.close() so the file lock is
-       released immediately — even on error. This stops Streamlit from starving DLT.
-  [F4] Retry window widened: 7 attempts × 5 s back-off (max ~35 s wait) instead of
-       5 attempts × 3 s, giving Streamlit more time to release the handle between tries.
-
-Run (inside venv):
-  source .venv/Scripts/activate          # Windows
-  dagster dev -f dagster_app1.py
-  
-Optional ML:
-  set ENABLE_ML=1   (PowerShell)  OR  export ENABLE_ML=1 (Git Bash / Linux)
+This Dagster application orchestrates the full data pipeline for Stockholm traffic congestion analysis, including:
+- DLT ingestion of real-time SL departure data into DuckDB every 5 minutes.
 """
 
 from __future__ import annotations
@@ -438,11 +426,16 @@ if ENABLE_ML and ML_AVAILABLE:
     )
     def congestion_predictions(context) -> Output[pd.DataFrame]:
         model_pkl = PROJECT_ROOT / "ml_models" / "saved_models" / "congestion_predictor.pkl"
+        # ✅ REPLACE WITH
         if not model_pkl.exists():
-            raise SkipReason(
-                "No trained model found. Run ml_model_training first or: "
-                "python ml_models/congestion_predictor.py train"
-            )
+                context.log.warning(
+                "⏭️  No trained model found yet — skipping forecast. "
+                "ml_model_training will create the model once enough data accumulates."
+    )
+                return Output(
+        value=pd.DataFrame(),
+        metadata={"skipped": MetadataValue.bool(True)},
+        )
 
         context.log.info("🔮 Generating 7-day forecast with saved model…")
         predictions_df = generate_forecast()

@@ -2,13 +2,7 @@
 FILE: ml_models/congestion_predictor.py
 7-Day Congestion Prediction Model (Dagster-safe, DuckDB-safe)
 
-UPDATES:
-  [U1] ModelArtifacts now stores metrics dict (MAE, R², CV MAE, n_features, trained_at).
-  [U2] save_model() also writes model_metrics.json alongside the pkl so the Streamlit
-       dashboard can read real accuracy WITHOUT loading sklearn / joblib.
-  [U3] load_model() also reads the JSON and returns it as a convenience dict.
-  [U4] schema fallback list so predict_next_7_days() works whether the fact table
-       is in main_analytics_marts, analytics_analytics_marts, or analytics_marts.
+
 """
 
 from __future__ import annotations
@@ -51,8 +45,9 @@ def _project_root() -> Path:
 
 # ── Schema candidates (tried in order) ────────────────────────────────────────
 _FACT_SCHEMA_CANDIDATES = [
-    "main_analytics_marts",
+    
     "analytics_analytics_marts",
+    "main_analytics_marts",
     "analytics_marts",
 ]
 
@@ -606,7 +601,7 @@ class CongestionPredictor:
 
 def train_and_save_model() -> tuple[CongestionPredictor, dict[str, Any], Path]:
     predictor = CongestionPredictor()
-    metrics   = predictor.train_model(min_days=1)
+    metrics   = predictor.train_model(min_days=60)  # use last 60 days for more training data
     model_path = predictor.save_model()
     return predictor, metrics, model_path
 
