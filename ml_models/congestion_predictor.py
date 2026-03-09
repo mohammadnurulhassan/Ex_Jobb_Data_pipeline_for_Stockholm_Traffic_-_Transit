@@ -1,6 +1,6 @@
 """
 FILE: ml_models/congestion_predictor.py
-7-Day Congestion Prediction Model (Dagster-safe, DuckDB-safe)
+7-Day Congestion Prediction Model for Stockholm Traffic
 
 
 """
